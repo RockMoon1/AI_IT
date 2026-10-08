@@ -1,0 +1,46 @@
+# ---- Secrets: never commit these ------------------------------------------
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.aiit
+*.signed.json
+secrets/
+**/keys/
+**/private/
+console-enrollment.json
+agent-identity.json
+redaction_map.json
+
+# ---- Runtime data (bundles, cases, logs contain customer data / PHI) --------
+data/
+cases/
+bundles/
+inbox/
+*.jsonl
+*.log
+
+# ---- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ---- Editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
