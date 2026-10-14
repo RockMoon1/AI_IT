@@ -55,7 +55,11 @@ def safe_join(base: Path, *parts: str) -> Path:
     for part in parts:
         if not isinstance(part, str) or not part or "\x00" in part:
             raise ValueError(f"invalid path component: {str(part)[:80]!r}")
-    target = base_r.joinpath(*parts).resolve()
+    base_abs = os.path.abspath(str(base_r))
+    candidate = os.path.normpath(os.path.join(base_abs, *parts))
+    if candidate != base_abs and not candidate.startswith(os.path.join(base_abs, "")):
+        raise ValueError(f"path escapes {base_r}: {'/'.join(parts)[:120]!r}")
+    target = Path(candidate).resolve()
     if target != base_r and base_r not in target.parents:
         raise ValueError(f"path escapes {base_r}: {'/'.join(parts)[:120]!r}")
     return target

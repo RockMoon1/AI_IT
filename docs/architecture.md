@@ -82,6 +82,15 @@ Signature is Ed25519 over the canonical JSON of `plan`. The plan itself
 carries `target_agent_id`, `case_id`, `expires_at` and `plan_id`; the agent
 keeps the list of applied plan ids to refuse replays.
 
+### Audit log side files
+
+`audit.jsonl` is the hash chain itself. `audit.jsonl.head.json` is the signed
+checkpoint (`seq`, `hash`, byte offset, signer key, signature) written after
+every state-changing command; verification fails if the log is shorter than
+the checkpoint or the checkpointed entry differs. `audit.jsonl.corrupt`
+collects torn fragments quarantined by `audit repair-tail`. The actions
+`audit_chain_broken` and `audit_tail_repaired` are themselves chained entries.
+
 ### Case folder (console)
 
 ```
@@ -103,9 +112,18 @@ email always becomes the same `<EMAIL_7f3a9c21>` token inside one case and the
 model can still correlate, but tokens are not reversible without the map.
 
 Covered by regex today: email, US SSN, US phone, credit card (Luhn checked),
-IPv4 (public by default, private optional), MAC address, user profile paths on
-all three OSes, hostname, obvious secrets (passwords, tokens, bearer headers,
-AWS and GitHub key shapes, PEM blocks) which are replaced irreversibly.
+IPv4 and IPv6 (public by default, private optional, loopback and link-local
+never), MAC address, user profile paths on all three OSes including
+JSON-escaped and UNC home shares, `DOMAIN\user`, domain and Azure AD SIDs,
+UNC server names, hostnames (word-bounded, case-insensitive), labelled serial
+numbers, product ids, hardware and platform UUIDs, UDIDs, machine ids,
+registered owner and organisation, user and computer names; and secrets
+(key/value passwords, passphrases, tokens and API keys with any prefix, URL
+userinfo, Authorization headers, JWTs, AWS, GitHub, GitLab, OpenAI, Anthropic,
+Slack, Discord, Telegram and Google token shapes, PEM blocks), which are
+replaced irreversibly. The effective configuration is persisted per case in
+`redaction_config.json`, seeded with the hostname and the account names found
+in the bundle, so reports and operator text are redacted with the same rules.
 
 Not covered: free-text person names, street addresses, dates of birth in
 prose. That needs NLP (Presidio) and is a roadmap item. Until then, the

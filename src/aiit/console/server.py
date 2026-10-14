@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 from .. import __version__
 from ..common.crypto import CryptoError
-from ..common.util import new_id, read_json, validate_id
+from ..common.util import new_id, read_json, safe_join, validate_id
 from .store import ConsoleState
 
 MAX_BODY = 64 * 1024 * 1024
@@ -47,7 +47,8 @@ class MailboxHandler(BaseHTTPRequestHandler):
     # -- plumbing ---------------------------------------------------------------
     def log_message(self, fmt: str, *args: Any) -> None:
         ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-        print(f"[serve {ts}] {self.address_string()} {fmt % args}", file=sys.stderr)
+        line = "".join(ch if ch.isprintable() else "?" for ch in (fmt % args))[:400]
+        print(f"[serve {ts}] {self.address_string()} {line}", file=sys.stderr)
 
     def _json(self, code: int, obj: Any, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(obj).encode("utf-8")
@@ -159,7 +160,11 @@ class MailboxHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._json(400, {"error": "agent_id required"})
             return
-        ob = self.state.outbox / agent_id
+        try:
+            ob = safe_join(self.state.outbox, agent_id)
+        except ValueError:
+            self._json(400, {"error": "agent_id required"})
+            return
         plans = [read_json(p) for p in sorted(ob.glob("*.signed.json"))] if ob.exists() else []
         self._json(200, plans)
 

@@ -153,6 +153,7 @@ signed plan wire formats; existing bundles and plans remain readable.
   scripted `FakeHTTP` server in `tests/helpers.py`.
 
 ### Changed
+- Collectors run under the same scrubbed environment as plan steps, so the `env_names` collector now lists only that reduced set (no `AIIT_*`, token, key or passphrase variables reach a bundle).
 
 - **BREAKING**: the console reads `.env` from its data directory
   (`<data dir>/.env`, default `~/.aiit/console/.env`) or from

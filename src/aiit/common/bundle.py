@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tarfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -64,7 +65,11 @@ def unpack_to(data: bytes, dest: Path) -> list[str]:
                 total += m.size
                 if total > MAX_TOTAL_BYTES:
                     raise CryptoError(f"bundle exceeds {MAX_TOTAL_BYTES} bytes uncompressed")
-            target = (dest_r / m.name).resolve()
+            dest_abs = os.path.abspath(str(dest_r))
+            member_abs = os.path.normpath(os.path.join(dest_abs, m.name))
+            if member_abs != dest_abs and not member_abs.startswith(os.path.join(dest_abs, "")):
+                raise CryptoError(f"bundle member escapes destination: {m.name[:120]!r}")
+            target = Path(member_abs).resolve()
             if target != dest_r and dest_r not in target.parents:
                 raise CryptoError(f"bundle member escapes destination: {m.name[:120]!r}")
         for m in members:
