@@ -71,6 +71,43 @@ def _skip_kv(m: re.Match[str]) -> bool:
     return value.lower() in _VALUE_EXCLUDE
 
 
+# Tools whose -p takes a port, pid, path or pattern. For these a spaced -p is
+# never a password; everything else is treated as one unless the value is a
+# number or a path.
+_DASH_P_PORT_TOOLS = frozenset("""
+mkdir ssh scp sftp slogin nc ncat netcat socat ps lsof strace ltrace gdb netstat docker podman nerdctl psql
+pg_dump pg_dumpall pg_restore pg_isready createdb dropdb vacuumdb redis-cli nmap ping ping6 traceroute tracepath sudo
+sort install kill pgrep pkill top htop perf cp rsync tar git sshfs telnet ssh-copy-id ssh-keyscan hping3 iperf iperf3
+nping kubectl helm ab wrk siege tcpdump tshark nmcli openvpn wg dig host nslookup java node ruby python python3 pip
+pip3 npm yarn pnpm gpg gpg2 ssh-keygen openssl mount umount cron crontab at tee sed awk grep egrep fgrep find xargs
+cut paste join head tail less more diff patch dd mkfs fsck tune2fs lvcreate lvextend mongod mongos mysqld sshd nginx
+apache2 httpd php composer go cargo make cmake gcc clang ld ldd rpm dpkg apt apt-get yum dnf zypper pacman brew port
+choco winget wget curl ls dir cat df du stat file wc chmod chown date env printenv export set echo printf type which
+whereis locate man info help history ln mv rm touch basename dirname readlink realpath uname hostname id who w last
+lastlog free uptime vmstat iostat sar mpstat pidstat ss ip route arp ifconfig ethtool iw iwconfig bridge tc fuser
+lsblk blkid fdisk parted lsusb lspci lshw dmidecode dmesg journalctl systemctl service launchctl defaults diskutil
+sw_vers system_profiler networksetup scutil dscacheutil pmset tmutil softwareupdate spctl csrutil log wmic powershell
+pwsh cmd net sc reg tasklist taskkill schtasks ipconfig netsh nbtstat getmac systeminfo driverquery whoami gpupdate
+gpresult sfc dism chkdsk diskpart bcdedit wevtutil cipher compact icacls takeown attrib xcopy robocopy forfiles
+findstr where tree fc comp zip unzip 7z gzip gunzip bzip2 xz zstd chattr mktemp sleep timeout watch screen tmux
+""".split())
+_SEG_START_RE = re.compile(r"[;&|\r\n]")
+_WRAPPER_WORDS = {"sudo", "doas", "env", "nohup", "time", "exec", "command", "nice", "xargs", "busybox", "timeout"}
+
+
+def _skip_dash_p(m: "re.Match[str]") -> bool:
+    """Skip a spaced -p when the segment's command is a known port/pid/path tool."""
+    seg = _SEG_START_RE.split(m.string[: m.start()])[-1]
+    for t in seg.split():
+        base = t.lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if base in _WRAPPER_WORDS or base.startswith("-") or "=" in t or base.isdigit():
+            continue
+        if base.endswith(".exe"):
+            base = base[:-4]
+        return base in _DASH_P_PORT_TOOLS
+    return False
+
+
 @dataclass(frozen=True)
 class _SecretRule:
     name: str
@@ -103,10 +140,31 @@ SECRET_RULES: list[_SecretRule] = [
     _SecretRule("flag", re.compile(
         r"(?i)(?<![\w-])--?(?:[a-z]+[-_]?)?" + _SECRET_WORDS + r"\b[ \t]+(?!-)" + _SECRET_VALUE.replace("{4,}", "{1,}")),
         (1, 2, 3)),
-    # mysql/mariadb style -pSECRET (no space) and the quoted -p'x' form anywhere
-    _SecretRule("mysql_p", re.compile(
-        r"(?i)\b(?:mysql\w*|mariadb\w*)\b[^\r\n]*?(?<=\s)-p(?!\s)[\"']?([^\s\"']+)[\"']?"), (1,)),
-    _SecretRule("quoted_p", re.compile(r"(?<![\w-])-p(?:'([^'\r\n<>]+)'|\"([^\"\r\n<>]+)\")"), (1, 2)),
+    # Database and remote-access clients: -pSECRET glued to the flag.
+    _SecretRule("tool_p", re.compile(
+        r"(?i)\b(?:mysql\w*|mariadb\w*|mongosh|mongo|sshpass|psexec\w*|certutil|winrs|smbpasswd|rclone|sqlcmd)\b"
+        r"[^\r\n|;&]*?(?<=\s)-p(?!\s|\d+(?:\s|$))[\"']?([^\s\"']+)[\"']?"), (1,)),
+    # -p 'x' / -p "x" (glued or spaced); -p VALUE for anything that is not a known
+    # port/pid/path tool and whose value is not a number or a path. Over-redacting
+    # an odd flag loses a little diagnostic text; under-redacting ships a password.
+    _SecretRule("quoted_p", re.compile(r"(?<![\w-])-[pP][ \t]*(?:'([^'\r\n<>]+)'|\"([^\"\r\n<>]+)\")"), (1, 2), _skip_dash_p),
+    _SecretRule("dash_p", re.compile(
+        r"(?<![\w-])-[pP][ \t]+(?![-/.~\\]|[A-Za-z]:[\\/]|[\d:,.\-]+(?:[\s;&|]|$))([^\s\"'<>;&|]{3,})"), (1,), _skip_dash_p),
+    # Tool-specific credential flags with a separate argument.
+    _SecretRule("sqlcmd_P", re.compile(r"(?i)\bsqlcmd\b[^\r\n|;&]*?\s-P[ \t]*(?!-)([^\s\"']+)"), (1,)),
+    _SecretRule("ldap_w", re.compile(r"(?i)\bldap\w*\b[^\r\n|;&]*?\s-w[ \t]+(?!-)([^\s\"']+)"), (1,)),
+    _SecretRule("redis_a", re.compile(r"(?i)\bredis-cli\b[^\r\n|;&]*?\s-a[ \t]+(?!-)([^\s\"']+)"), (1,)),
+    _SecretRule("snmp_auth", re.compile(r"(?i)\bsnmp\w+\b[^\r\n|;&]*?\s(?-i:-[AX])[ \t]+(?!-)([^\s\"']+)"), (1,)),
+    _SecretRule("smb_percent", re.compile(r"(?i)\s-U[ \t]+[^\s%\"']+%([^\s\"']+)"), (1,)),
+    _SecretRule("openssl_pass", re.compile(r"(?i)\bpass(?:in|out)?[ \t]+pass:([^\s\"']+)"), (1,)),
+    _SecretRule("schtasks_rp", re.compile(r"(?i)\bschtasks\b[^\r\n]*?\s/(?:rp|p)[ \t]+(?!/)([^\s/\"']+)"), (1,)),
+    _SecretRule("slash_pass", re.compile(r"(?i)/(?:pass|password|pw|rp)[:=]\s*(?!/|\*)([^\s/\"']+)"), (1,)),
+    _SecretRule("net_use", re.compile(
+        r"(?i)\bnet\s+use\b(?:\s+[^\s\\/]+)?\s+\\\\[^\s\"']+\s+(?!/|\*)([^\s/\"']+)"), (1,)),
+    _SecretRule("net_use_after_user", re.compile(
+        r"(?i)\bnet\s+use\b[^\r\n;&|]*?/user:\S+\s+(?!/|\*)([^\s/\"']+)"), (1,)),
+    _SecretRule("user_colon", re.compile(
+        r"(?i)(?<![\w-])(?:-u|--user|--proxy-user|-U)[ \t=]+[^\s:\"'@]+:([^\s\"'@]+)"), (1,)),
     # well-known token shapes
     _SecretRule("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     _SecretRule("aws_secret", re.compile(

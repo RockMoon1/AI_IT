@@ -160,9 +160,38 @@ class SecretTests(unittest.TestCase):
         self.assert_secret("mysql -u appuser --password=" + "Tr0ub" + "4dor appdb", "Tr0ub" + "4dor")
         self.assert_secret("mysql -u root -p'" + "Tr0ub" + "4dor' appdb", "Tr0ub" + "4dor", keep=("appdb",))
         self.assert_secret("mysqldump -u root -p" + "Tr0ub" + "4dor appdb", "Tr0ub" + "4dor")
-        # -p followed by a space is a port or a flag, never a password
+        # -p followed by a space is a port, pid or path for the usual tools
         out = Redactor(KEY).redact("ssh -p 2222 host; mkdir -p dir; find . -print")
         self.assertEqual(out, "ssh -p 2222 host; mkdir -p dir; find . -print")
+
+    def test_spaced_dash_p_is_a_password_for_other_tools(self):
+        pw = "MyDb" + "Pass"
+        self.assert_secret("-p " + pw, pw)
+        self.assert_secret("someclient -p " + pw + " --host x", pw, keep=("--host x",))
+        self.assert_secret("sshpass -p " + pw + " ssh bob@h", pw, keep=("ssh",))
+        self.assert_secret("mongosh -u bob -p " + pw + " --host h", pw, keep=("-u bob",))
+        self.assert_secret("psexec \\\\h -u bob -p " + pw + " cmd", pw)
+        self.assert_secret("certutil -p " + pw + " -importpfx x.pfx", pw)
+        self.assert_secret("useradd -p '" + pw + "' bob", pw, keep=("bob",))
+        for untouched in [
+            "mkdir -p /var/log/app", "mkdir -p buildcache", "docker run -p 8080:80 nginx", "ps -p 1234",
+            "ls -p /var/log", "cp -p a b", "tar -p -xf x.tgz", "grep -P 'x+' file", "wget -P downloads http://x",
+            "scp -P 2222 a b:", "mysql -u root -P 3306 -h db",
+        ]:
+            self.assertEqual(Redactor(KEY).redact(untouched), untouched)
+
+    def test_tool_specific_credential_flags(self):
+        pw = "S3cr" + "et!x"
+        self.assert_secret("sqlcmd -S srv -U sa -P " + pw + " -Q 'select 1'", pw, keep=("-U sa",))
+        self.assert_secret("cmdkey /add:srv /user:bob /pass:" + pw, pw, keep=("/user:bob",))
+        self.assert_secret("net use Z: \\\\srv\\share " + pw + " /user:dom\\bob", pw, keep=("/user:dom",))
+        self.assert_secret("net use \\\\srv\\share /user:dom\\bob " + pw, pw, keep=("/user:dom",))
+        self.assert_secret("curl -u admin:" + pw + " https://x", pw, keep=("admin:",))
+        self.assert_secret("redis-cli -a " + pw + " ping", pw, keep=("ping",))
+        self.assert_secret("smbclient //srv/share -U bob%" + pw, pw, keep=("bob%",))
+        self.assert_secret("openssl pkcs12 -export -passout pass:" + pw + " -out x.p12", pw, keep=("-out x.p12",))
+        self.assert_secret("schtasks /create /tn x /ru bob /rp " + pw + " /tr x.exe", pw, keep=("/ru bob",))
+        self.assert_secret("ldapsearch -D cn=admin -w " + pw + " -b dc=x", pw, keep=("-b dc=x",))
 
     def test_kv_false_positives_are_limited(self):
         r = Redactor(KEY)

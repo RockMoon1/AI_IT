@@ -49,6 +49,28 @@ jobs:
           category: "/language:${{ matrix.language }}"
           output: sarif-results
 
+      - name: Print the alerts into the job log
+        if: always()
+        shell: python
+        run: |
+          import glob, json
+          for path in sorted(glob.glob("sarif-results/*.sarif")):
+              data = json.load(open(path, encoding="utf-8"))
+              for run in data.get("runs", []):
+                  rules = {r["id"]: r for r in run["tool"]["driver"].get("rules", [])}
+                  for ext in run["tool"].get("extensions", []):
+                      for r in ext.get("rules", []):
+                          rules[r["id"]] = r
+                  results = run.get("results", [])
+                  print(f"CODEQL {path}: {len(results)} result(s)")
+                  for x in results:
+                      rid = x.get("ruleId", "?")
+                      props = rules.get(rid, {}).get("properties", {})
+                      loc = x["locations"][0]["physicalLocation"]
+                      where = f"{loc['artifactLocation']['uri']}:{loc.get('region', {}).get('startLine', '?')}"
+                      text = x["message"]["text"].replace("\n", " ")
+                      print(f"ALERT sev={props.get('security-severity', '-')} {rid} {where} :: {text}")
+
       - name: Keep the SARIF as an artifact (alert triage without the web UI)
         uses: actions/upload-artifact@v4
         with:

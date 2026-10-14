@@ -170,6 +170,11 @@ _PS_ALIASES: dict[str, str] = {
     "sv": "set-variable",
 }
 
+_SC_EXE_VERBS = {
+    "query", "qc", "queryex", "enumdepend", "config", "create", "delete", "start", "stop", "pause",
+    "continue", "failure", "sdshow", "sdset", "description", "interrogate", "control", "qdescription",
+}
+
 _POSIX_PREFIXES = {
     "sudo", "doas", "env", "command", "exec", "nohup", "nice",
     "xargs", "busybox", "time",
@@ -188,12 +193,21 @@ def normalise(command: str, os_name: str) -> str:
     """
     if os_name == "windows":
         s = command.replace("`", "").lower()
+        s = re.sub(r"\$\{([\w:]+)\}", r"$\1", s)
         s = re.sub(r"\s+", " ", s).strip()
         toks = s.split(" ")
-        toks = [_PS_ALIASES.get(t, t) for t in toks]
-        return " ".join(toks)
+        out = []
+        for i, t in enumerate(toks):
+            # sc.exe (service control) is not the Set-Content alias when a
+            # service verb follows it.
+            if t == "sc" and i + 1 < len(toks) and toks[i + 1] in _SC_EXE_VERBS:
+                out.append(t)
+            else:
+                out.append(_PS_ALIASES.get(t, t))
+        return " ".join(out)
     # POSIX family (linux, macos, any)
     s = command.replace('"', "").replace("'", "").replace("\\", "")
+    s = re.sub(r"\$\{(\w+)\}", r"$\1", s)
     s = re.sub(r"/{2,}", "/", s)
     s = re.sub(r"/\./", "/", s)
     if os_name == "macos":
@@ -235,6 +249,7 @@ _STRUCTURAL: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"/dev/tcp/", re.I), "/dev/tcp redirection"),
     (re.compile(r"\bbash\s+-i\b", re.I), "interactive bash shell"),
     (re.compile(r"\beval\b", re.I), "eval"),
+    (re.compile(r"\bchmod\b[^;&|]*\s(?:[0-7]*[4-7][0-7]{3}\b|[ugoa]*[+=][rwxXt]*s)", re.I), "setuid/setgid bit"),
 ]
 
 # Command substitution: only meaningful for POSIX shells.
@@ -247,7 +262,11 @@ _RM_POSIX_ROOT = re.compile(
     r"(?:\s|=)" + _SYS_ROOTS_POSIX + r"(?:/\S*)?(?:\s|;|&|\||$)", re.I)
 _REMOVE_ITEM = re.compile(r"\bremove-item\b", re.I)
 _REMOVE_ITEM_RECURSE = re.compile(r"-recurse\b|\s-r\b", re.I)
-_WIN_ROOT = re.compile(r"[a-z]:\\(?:windows|users|program files)?(?:\s|$|\\)", re.I)
+_WIN_ROOT = re.compile(
+    r"[a-z]:\\(?:windows|users|program files)?(?:\s|$|\\)"
+    r"|\$(?:home|env:userprofile|env:systemroot|env:windir|env:programfiles|env:systemdrive)\b"
+    r"|%(?:userprofile|systemroot|windir|programfiles|systemdrive)%",
+    re.I)
 
 
 def _recursive_delete_reason(raw: str, norm: str) -> str:
@@ -260,9 +279,227 @@ def _recursive_delete_reason(raw: str, norm: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Command segments and output redirection
+# ---------------------------------------------------------------------------
+_SEG_SPLIT_RE = re.compile(r"\s*(?:\|\|?|&&?|;|\r?\n)\s*")
+# An output redirection and its target. The leading class keeps ``->``, ``=>``
+# and ``<>`` out; descriptor duplication (``2>&1``) is folded away before use.
+_REDIR_RE = re.compile(r"(?:^|[^<>=\-])\d*>>?\s*([^\s;&|<>]+)?")
+_NULL_TARGET_RE = re.compile(r"^(?:/dev/null|\$null|nul)$", re.I)
+_TEMP_TARGET_RE = re.compile(
+    r"/tmp/|/var/tmp/|/private/tmp/|/var/folders/|/private/var/folders/|\$tmpdir\b|\$env:te?mp\b|%te?mp%"
+    r"|[a-z]:[\\/](?:temp|tmp)[\\/]|[a-z]:[\\/]windows[\\/]temp[\\/]|[\\/]appdata[\\/]local[\\/]temp[\\/]"
+    r"|^~/|^\$home/|^\$env:userprofile[\\/]|^%userprofile%[\\/]",
+    re.I)
+# Verbs whose first path argument is a file they write to.
+_WRITER_VERB_RE = re.compile(
+    r"^\s*(?:tee|tee-object|out-file|set-content|add-content|export-csv|export-clixml)\b", re.I)
+_PATHISH_RE = re.compile(r"[\\/.:~$%]")
+
+
+def _strip_quote_chars(s: str) -> str:
+    return s.replace('"', "").replace("'", "")
+
+
+def _segments(s: str) -> list[str]:
+    """Split a command on shell separators (; && || | &) after folding fd redirections.
+
+    ``&>file`` becomes ``>file`` (it writes a file); ``2>&1``-style descriptor
+    duplication is dropped so its ``&`` does not split the segment.
+    """
+    s = re.sub(r"&>>?", ">", s)
+    s = re.sub(r"\d*>&\s*\d+", " ", s)
+    return [seg for seg in _SEG_SPLIT_RE.split(s) if seg.strip()] or [s]
+
+
+_WRAPPERS = _POSIX_PREFIXES | {
+    "timeout", "ionice", "setsid", "stdbuf", "unbuffer", "chroot", "watch", "strace", "ltrace",
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "pwsh", "powershell", "powershell.exe", "pwsh.exe",
+}
+# Wrapper flags that take an argument (sudo -u user, env -C dir, timeout -s SIG, ...).
+_WRAPPER_ARG_FLAGS = {"-u", "-g", "-d", "-h", "-p", "-r", "-t", "-T", "-U", "-s", "-k", "-n",
+                      "--user", "--group", "--chdir", "--host", "--prompt", "--signal", "--kill-after",
+                      "-executionpolicy", "-ep", "-version", "-v", "-workingdirectory", "-wd"}
+# Wrapper flags after which the wrapped command itself follows (sh -c, pwsh -Command).
+_WRAPPER_CMD_FLAGS = {"-c", "-lc", "-ec", "-command", "-noprofile", "-noninteractive", "-nologo", "-noexit",
+                      "-sta", "-mta", "-file", "-f"}
+
+
+def _lead_verb(seg: str) -> tuple[str, int]:
+    """Return (verb, index) of the first token that is not a wrapper, its flag or VAR=value.
+
+    ``sudo -u root cp a b`` -> ("cp", 3); ``sh -c cp a b`` -> ("cp", 2);
+    ``timeout 5 rm x`` -> ("rm", 2). Quoted strings were stripped by the caller.
+    """
+    toks = seg.split()
+    skip_next = False
+    for i, t in enumerate(toks):
+        if skip_next:
+            skip_next = False
+            continue
+        low = t.lower()
+        base = low.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if base in _WRAPPERS or ("=" in t and not t.startswith("-")) or re.fullmatch(r"\d+[smhd]?", low):
+            continue
+        if t.startswith("-"):
+            skip_next = low in _WRAPPER_ARG_FLAGS and low not in _WRAPPER_CMD_FLAGS
+            continue
+        return base, i
+    return "", len(toks)
+
+
+def _write_targets(seg: str) -> list[str]:
+    """Targets of output redirections and writer verbs in one segment ('' = unknown)."""
+    out = [m.group(1) or "" for m in _REDIR_RE.finditer(seg)]
+    if _WRITER_VERB_RE.match(seg):
+        toks = [t for t in seg.split()[1:] if not t.startswith("-") and _PATHISH_RE.search(t)]
+        out.extend(toks or [""])
+    return out
+
+
+def _write_floor(seg: str) -> str | None:
+    """Floor implied by file writes: medium, low for temp or home targets, None without writes."""
+    floor: str | None = None
+    for t in _write_targets(seg):
+        if t and _NULL_TARGET_RE.match(t):
+            continue
+        if t and _TEMP_TARGET_RE.search(t):
+            floor = floor or "low"
+        else:
+            return "medium"
+    return floor
+
+
+# ---------------------------------------------------------------------------
+# Protected files and keys: never written by a plan, whatever max_risk says
+# (authentication, persistence, boot, kernel, security software, CA stores).
+# Reads stay allowed except for credential stores, which are never touched.
+# ---------------------------------------------------------------------------
+_SENSITIVE_POSIX_RE = re.compile(
+    r"(?:^|[\s=:,(])(?:/private)?(?:"
+    r"/etc/(?:passwd|shadow|group|gshadow|sudoers|sudoers\.d|ssh|pam\.d|pam\.conf|security|login\.defs|securetty"
+    r"|ld\.so\.preload|ld\.so\.conf|ld\.so\.conf\.d|profile|profile\.d|bash\.bashrc|bashrc|zshrc|zprofile|zshenv|environment"
+    r"|cron\S*|crontab|anacrontab|systemd|init\.d|rc\.local|rc\d?\.d|xdg/autostart|polkit-1|modprobe\.d|modules-load\.d|modules"
+    r"|ssl|pki|ca-certificates\S*|apparmor\S*|selinux|audit\S*|default/grub|grub\S*|authorization|sudo\.conf)"
+    r"|/var/spool/cron|/var/db/sudo|/var/db/dslocal|/var/root|/boot|/efi|/lib/systemd|/usr/lib/systemd|/lib/modules|/usr/lib/modules"
+    r"|/usr/local/share/ca-certificates"
+    r"|/library/(?:launchdaemons|launchagents|startupitems|privilegedhelpertools|security|keychains|extensions|systemextensions"
+    r"|managed preferences|preferences/com\.apple\.loginwindow\S*|preferences/systemconfiguration/com\.apple\.boot\S*)"
+    r"|/system/library|/private/var/db/(?:sudo|dslocal|configurationprofiles)"
+    r"|(?:~|\$home|/home/[^/\s]+|/users/[^/\s]+|/root|/var/root)/(?:\.ssh|\.bashrc|\.bash_profile|\.bash_login|\.bash_logout|\.profile"
+    r"|\.zshrc|\.zprofile|\.zshenv|\.zlogin|\.config/autostart|\.config/systemd|\.gnupg|\.aws|\.kube|\.docker|\.npmrc|\.pypirc|\.netrc"
+    r"|\.gitconfig|library/launchagents|\.local/share/systemd)"
+    r")(?=[/\s;&|)*]|$)"
+    r"|(?<![\w-])\.ssh/",
+    re.I)
+# System directory writes are protected except the usual cleanup targets.
+_WIN_SYSDIR_EXEMPT = (
+    r"(?!(?:temp|logs|prefetch|softwaredistribution|ccmcache|minidump|servicing[\\/]lcu"
+    r"|system32[\\/](?:drivers[\\/]etc|spool[\\/]printers|catroot2|logfiles|config[\\/]systemprofile[\\/]appdata))"
+    r"(?:[\\/]|\s|\*|$))"
+)
+_SENSITIVE_WIN_RE = re.compile(
+    r"(?:(?<![\w.])[a-z]:[\\/](?:windows|winnt)|%systemroot%|\$env:systemroot|%windir%|\$env:windir)[\\/]" + _WIN_SYSDIR_EXEMPT
+    + r"|\$(?:profile|psprofile)\b|[\\/](?:my )?documents[\\/](?:windows)?powershell[\\/]"
+    r"|[\\/]start menu[\\/]programs[\\/]startup|[\\/]programdata[\\/]ssh[\\/]|(?<![\w-])\.ssh[\\/]"
+    r"|[\\/]program files(?: \(x86\))?[\\/]windows defender|[\\/]programdata[\\/]microsoft[\\/]windows defender|[\\/]windows defender[\\/]"
+    r"|[\\/]system volume information|[\\/]boot[\\/]bcd|[\\/]efi[\\/]|[\\/]\$recycle\.bin"
+    r"|hk(?:lm|ey_local_machine)[:\\/]+(?:sam|security)\b"
+    r"|[\\/]currentversion[\\/](?:run|runonce|runonceex|runservices|runservicesonce|policies[\\/]explorer[\\/]run|winlogon"
+    r"|image file execution options|explorer[\\/]shellserviceobjectdelayload|explorer[\\/]browser helper objects|app paths)\b"
+    r"|[\\/]control[\\/](?:lsa|securityproviders|session manager|safeboot|terminal server)\b"
+    r"|[\\/]policies[\\/](?:system|microsoft[\\/]windows defender)\b|appinit_dlls"
+    r"|[\\/]classes[\\/](?:exefile|batfile|cmdfile|comfile|msifile|mscfile|scrfile|\.exe|\.bat|\.cmd|\.ps1|\.com)\b",
+    re.I)
+# Credential stores: a plan never reads or copies these, on any OS.
+_CRED_STORE_RE = re.compile(
+    r"/etc/(?:shadow|gshadow|master\.passwd)\b|/etc/shadow-|/etc/gshadow-"
+    r"|\.ssh[\\/]id_[a-z0-9]+\b(?!\.pub)|\.aws[\\/]credentials\b|\.netrc\b|\.pgpass\b|\.my\.cnf\b|\.git-credentials\b"
+    r"|\.docker[\\/]config\.json\b|\.kube[\\/]config\b|/var/db/dslocal/nodes/default/users|/var/db/shadow/hash"
+    r"|\breg(?:\.exe)?\s+(?:save|export)\s+(?:hklm|hkey_local_machine)[\\/](?:sam|security|system)\b"
+    r"|\bntds\.dit\b|\blsass\b|\bprocdump\b|\bmimikatz\b|\bsekurlsa\b|\bvaultcmd\b|\bcmdkey\s+/list"
+    r"|harddiskvolumeshadowcopy|\bsecurity\s+(?:find-generic-password|find-internet-password|dump-keychain|export)\b"
+    r"|/library/keychains|\.keychain(?:-db)?\b|\bdscl\b[^;&|]*-read[^;&|]*(?:authenticationauthority|shadowhashdata)"
+    r"|\bgetent\s+(?:shadow|gshadow)\b|\bunshadow\b",
+    re.I)
+_COPY_VERBS = frozenset({
+    "cp", "mv", "install", "ln", "rsync", "scp", "sftp", "copy", "move", "copy-item", "move-item",
+    "xcopy", "robocopy", "rename-item", "ren", "rename", "dd",
+})
+_DEST_FLAG_RE = re.compile(r"^(?:-destination|-dest|-t|--target-directory)(?:[:=]|$)|^of=", re.I)
+_WRITERS_POSIX_RE = re.compile(
+    r"^(?:tee|cp|mv|install|ln|dd|truncate|chmod|chown|chgrp|chattr|setfacl|chflags|rm|unlink|shred|touch|mkdir|rmdir"
+    r"|patch|rsync|scp|sftp|curl|wget|sed\s+-[a-z]*i|perl\s+-[a-z]*i|crontab|visudo|usermod|useradd|chpasswd|passwd"
+    r"|ssh-keygen|ssh-copy-id|security\s+(?:add|import|delete|set)\S*|defaults\s+(?:write|delete)|plutil|launchctl\s+(?:load|bootstrap|enable|submit)"
+    r"|systemctl\s+(?:enable|edit|link|set-\w+)|update-rc\.d|chkconfig|update-ca-certificates|update-grub|grub-install|mkinitcpio|dracut"
+    r"|update-initramfs|kextload|kmutil|nvram|pmset|profiles|find\b[^;&|]*\s-(?:delete|exec|execdir|ok|okdir)|git)\b",
+    re.I)
+_WRITERS_WIN_RE = re.compile(
+    r"^(?:out-file|set-content|add-content|clear-content|tee-object|tee|copy-item|move-item|new-item|remove-item|rename-item"
+    r"|set-itemproperty|new-itemproperty|remove-itemproperty|rename-itemproperty|clear-itemproperty|set-item|clear-item|set-acl"
+    r"|export-\w+|invoke-webrequest|invoke-restmethod|start-bitstransfer|copy|move|del|erase|rd|rmdir|md|mkdir|ren|rename|icacls|takeown|attrib|cacls"
+    r"|xcopy|robocopy|expand|makecab|cipher|compact|certutil|bitsadmin|curl|wget|reg(?:\.exe)?\s+(?:add|delete|import|restore|load|copy)"
+    r"|new-scheduledtask\w*|register-scheduledtask|schtasks|get-childitem\b[^;&|]*\|?\s*remove-item|forfiles)\b",
+    re.I)
+_DOTNET_FILE_RE = re.compile(
+    r"\[(?:system\.)?io\.(?:file|directory)\]::(?:write|append|copy|move|delete|create|replace|set)", re.I)
+
+
+def _copy_dest_sensitive(seg: str, sens: "re.Pattern[str]") -> bool:
+    """For copy-like verbs, deny only when a protected path is the destination."""
+    toks = seg.split()
+    _, vi = _lead_verb(seg)
+    args = toks[vi + 1:]
+    # Explicit destination flag (-Destination, -t, of=): anything after it counts.
+    pos = len(seg)
+    for i, t in enumerate(args):
+        if _DEST_FLAG_RE.match(t):
+            pos = seg.find(t)
+            break
+    if pos < len(seg):
+        return bool(sens.search(seg[pos:]))
+    # Otherwise the first non-flag argument is the source; later mentions are destinations.
+    first = next((t for t in args if not t.startswith("-") and not re.match(r"^/[a-z]{1,4}(?::\S*)?$", t, re.I)), None)
+    if first is None:
+        return bool(sens.search(seg))
+    start = seg.find(first) + len(first)
+    return bool(sens.search(seg[start:]))
+
+
+def _sensitive_write_reason(raw: str, norm: str, os_name: str) -> str:
+    """Deny writes to protected files or keys and any touch of a credential store."""
+    win = os_name == "windows"
+    sens = _SENSITIVE_WIN_RE if win else _SENSITIVE_POSIX_RE
+    writers = _WRITERS_WIN_RE if win else _WRITERS_POSIX_RE
+    for text in (raw, norm):
+        text = _strip_quote_chars(text)
+        if _CRED_STORE_RE.search(text):
+            return "access to a credential store"
+        for seg in _segments(text):
+            if not sens.search(seg):
+                continue
+            for t in _write_targets(seg):
+                if t and sens.search(" " + t):
+                    return "write to a protected system file or key"
+            if _DOTNET_FILE_RE.search(seg):
+                return "write to a protected system file or key"
+            verb, vi = _lead_verb(seg)
+            if verb in _COPY_VERBS:
+                if _copy_dest_sensitive(seg, sens):
+                    return "write to a protected system file or key"
+                continue
+            if writers.match(" ".join(seg.split()[vi:])):
+                return "write to a protected system file or key"
+    return ""
+
+
 def _structural_reason(raw: str, norm: str, os_name: str) -> str:
     """Return a label for the first matching structural deny, else ''."""
     hit = _recursive_delete_reason(raw, norm)
+    if hit:
+        return hit
+    hit = _sensitive_write_reason(raw, norm, os_name)
     if hit:
         return hit
     for s in (raw, norm):
@@ -281,6 +518,17 @@ _READ_RE = re.compile(
     r"\b(?:get|test|select|measure|show|find|resolve)-\w+"
     r"|\b(?:cat|ls|dir|df|du|free|uptime|ip|ss|netstat|ipconfig|ping|nslookup|dig|scutil|sw_vers)\b"
     r"|\bjournalctl\b"
+    r"|\b(?:ps|pgrep|lsof|who|last|lsblk|lspci|lsusb|lshw|dmesg|dmidecode|lscpu|lsmod|nproc|arp|route|traceroute|tracert|pathping"
+    r"|tasklist|systeminfo|driverquery|gpresult|whoami|hostname|ver|tree|getmac|nbtstat|klist|nltest|dsregcmd|system_profiler|ioreg"
+    r"|vm_stat|vmstat|iostat|mpstat|sar|nstat|iwconfig|netsh\b[^;&|]*\bshow)\b"
+    r"|(?<![\w-])w(?=\s|$)|\bmount(?=\s*$|\s*[|;&])"
+    r"|\b(?:fdesetup|csrutil)\s+status\b|\bspctl\s+--status\b|\bpmset\s+-g\b|\btmutil\s+(?:status|listbackups|latestbackup|destinationinfo)\b"
+    r"|\bsoftwareupdate\s+(?:-l|--list|--history)\b|\bdefaults\s+read\b|\blaunchctl\s+print\b|\bprofiles\s+(?:list|show|status)\b"
+    r"|\bnetworksetup\s+-(?:get|list)\w*|\bscutil\s+--\w+|\bsysctl\s+(?:-a|-n)\b"
+    r"|\bsc(?:\.exe)?\s+(?:query|qc|queryex|enumdepend)\b|\bnet\s+(?:view|statistics|config|session)\b|\breg(?:\.exe)?\s+query\b"
+    r"|\bschtasks\s+/query\b|\bwevtutil\s+(?:qe|gl|el|gp)\b|\bpowercfg\s+[/-](?:list|l|query|q|energy|batteryreport|sleepstudy|a|devicequery)\b"
+    r"|\bmanage-bde\s+-status\b|\bfsutil\s+(?:fsinfo|volume\s+diskfree|dirty\s+query)\b|\bvssadmin\s+list\b|\bw32tm\s+/query\b"
+    r"|\bpnputil\s+/enum-\w+|\bwmic\b[^;&|]*\b(?:get|list)\b|\btop\s+-b|\bnmcli\b[^;&|]*\b(?:show|status)\b"
     r"|\bsystemctl\s+(?:status|is-active|list-\w+)\b"
     r"|\bsfc\s+/verifyonly\b"
     r"|\bchkdsk\b(?![^;&|]*\s/[fr]\b)"
@@ -292,6 +540,7 @@ _READ_RE = re.compile(
 )
 _LOW_RE = re.compile(
     r"\b(?:restart|start)-service\b"
+    r"|\b(?:stop-process|taskkill|killall|pkill|kill)\b"
     r"|\bsystemctl\s+(?:restart|start)\b"
     r"|\bipconfig\s+/flushdns\b"
     r"|\bdscacheutil\s+-flushcache\b"
@@ -315,33 +564,90 @@ _MUT_RE = re.compile(
     r"|\breg(?:\.exe)?\s+(?:add|delete)\b"
     r"|\bnetsh\b[^;&|]*\b(?:set|add|delete)\b"
     r"|\b(?:bcdedit|diskpart|mkfs|fdisk|parted|useradd|usermod)\b"
-    r"|\bcp\b[^;&|]*\s/(?:etc|usr|bin|sbin|boot|lib)/",
+    r"|\bcp\b[^;&|]*\s/(?:etc|usr|bin|sbin|boot|lib)/"
+    r"|\bfind\b[^;&|]*\s-(?:delete|exec|execdir|ok|okdir)\b"
+    r"|\bsysctl\s+-w\b"
+    r"|\bmount\s+[^|;&\s]|\bspctl\s+--(?:master|global|add|remove|enable|disable)\S*|\bcsrutil\s+(?:disable|enable|clear)"
+    r"|\blaunchctl\s+(?:load|unload|bootstrap|bootout|remove|enable|disable)\b"
+    r"|\btmutil\s+(?:delete|disable)\b"
+    r"|\bnetworksetup\s+-set\w*"
+    r"|\bdscl\b[^;&|]*\s-(?:create|delete|append|change|passwd)\b"
+    r"|\bsoftwareupdate\b[^;&|]*\s(?:-i|--install)\b"
+    r"|\b(?:sed|perl)\s+-[a-z]*i\b"
+    r"|\bschtasks\s+/(?:create|delete|change|run|end)\b"
+    r"|\bsc(?:\.exe)?\s+(?:config|create|delete|start|stop|pause|continue|failure)\b"
+    r"|\bnet\s+(?:user|localgroup|group|share|accounts|stop|start|use)\b"
+    r"|\bwmic\b[^;&|]*\b(?:call|set|delete|create)\b"
+    r"|\bdism\b[^;&|]*/(?:add|remove|enable-feature|disable-feature|cleanup-image)\b"
+    r"|\bpowercfg\s+[/-](?:change|setactive|h|hibernate|x)\b"
+    r"|\bcipher\s+/w\b"
+    r"|\b(?:winget|choco|scoop)\s+(?:install|uninstall|upgrade)\b"
+    r"|\b(?:npm|yarn|gem|cargo|go|snap|flatpak|port|mas)\s+(?:install|i|add|remove|refresh|uninstall)\b"
+    r"|\b(?:curl|wget)\b[^;&|]*\s(?:-o|-O|--output|--remote-name|-outfile)\b"
+    r"|\[(?:system\.)?io\.(?:file|directory)\]::(?:write|append|delete|copy|move|create|replace|set)",
     re.I,
 )
+# Mutating verbs that are also common file names: only counted in verb position.
+_MUT_VERB_RE = re.compile(
+    r"^(?:dd|truncate|chattr|setfacl|chflags|crontab|ln|shred|unlink|userdel|groupadd|groupdel|passwd|chpasswd|visudo"
+    r"|umount|modprobe|rmmod|insmod|kextload|kextunload|nvram|sysadminctl|msiexec|icacls|takeown|attrib|cacls"
+    r"|xcopy|robocopy|copy|move|del|erase|rd|rmdir|ren|rename|invoke-webrequest|start-bitstransfer|install)\b",
+    re.I,
+)
+# Pure filters that keep a pipeline read-only when they follow a read verb.
+_FILTER_RE = re.compile(
+    r"^\s*(?:grep|egrep|fgrep|zgrep|awk|gawk|sed(?![^;&|]*\s-[a-z]*i\b)|head|tail|sort|uniq|wc|cut|tr|column|more|less|strings|xxd|od"
+    r"|hexdump|jq|yq|findstr|where-object|where|\?|select-object|select|select-string|sls|format-(?:table|list|wide|custom|hex)|ft|fl|fw"
+    r"|sort-object|group-object|group|measure-object|measure|out-string|out-host|out-default|convertto-(?:json|csv|html|xml)"
+    r"|convertfrom-(?:json|csv)|echo|write-output|write-host|printf|true|date|hostname|whoami|id|uname|env|printenv|stat|file"
+    r"|readlink|realpath|basename|dirname|md5sum|sha\d*sum|shasum|base64(?![^;&|]*\s-(?:d|decode)\b)|type|nl|tac|rev|paste|comm|diff)"
+    r"(?:\s|$)",
+    re.I,
+)
+
+
+def _segment_floor(seg: str) -> str:
+    """Floor for one separator-free command segment."""
+    low = _LOW_RE.search(seg)
+    # A known low-risk repair verb is exempt from the mutating table, but only
+    # its own span: anything else mutating in the same segment still counts.
+    rest = seg if not low else seg[:low.start()] + " " + seg[low.end():]
+    if _MUT_RE.search(rest):
+        return "medium"
+    _, vi = _lead_verb(seg)
+    if _MUT_VERB_RE.match(" ".join(seg.split()[vi:])):
+        return "medium"
+    w = _write_floor(seg)
+    if w == "medium":
+        return "medium"
+    if low or w == "low":
+        return "low"
+    if _READ_RE.search(seg) or _FILTER_RE.match(seg):
+        return "read_only"
+    return "low"
 
 
 def floor_risk(command: str, os_name: str) -> str:
     """Compute a local minimum risk for a command from a verb table.
 
-    Read-only verbs (Get-*, cat, df, systemctl status, ...) impose no floor and
-    return "read_only". Service restarts and cache clears floor to "low".
-    Mutating verbs (Set-*, Remove-*, package installs, rm, chmod, ...) floor to
-    "medium". Anything unrecognised floors to "low". The floor is independent of
-    and never lowers the model-declared risk; see effective_risk.
+    The command is split on shell separators and the floor is the maximum over
+    its segments, so a read verb in front never lowers a mutating one behind
+    it. Read-only verbs (Get-*, cat, df, systemctl status, ...) and pure
+    filters impose no floor and return "read_only". Service restarts, cache
+    clears and process kills floor to "low", as do writes into temp or home
+    directories. Mutating verbs (Set-*, Remove-*, package installs, rm, chmod,
+    ...) and writes anywhere else floor to "medium". Anything unrecognised
+    floors to "low". The floor is independent of and never lowers the
+    model-declared risk; see effective_risk.
     """
     if not command or not command.strip():
         return "read_only"
     norm = normalise(command, os_name)
-    for s in (command, norm):
-        if _LOW_RE.search(s):
-            return "low"
-    for s in (command, norm):
-        if _READ_RE.search(s):
-            return "read_only"
-    for s in (command, norm):
-        if _MUT_RE.search(s):
-            return "medium"
-    return "low"
+    floor = "read_only"
+    for text in (_strip_quote_chars(command), _strip_quote_chars(norm)):
+        for seg in _segments(text):
+            floor = _max_risk(floor, _segment_floor(seg))
+    return floor
 
 
 def _max_risk(a: str, b: str) -> str:
