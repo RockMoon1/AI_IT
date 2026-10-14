@@ -71,14 +71,17 @@ class FakeHTTP:
                 else:
                     data = payload or b""
                     ctype = "application/octet-stream"
-                self.send_response(status)
-                self.send_header("Content-Type", headers.get("Content-Type", ctype))
-                self.send_header("Content-Length", str(len(data)))
-                for k, v in headers.items():
-                    if k != "Content-Type":
-                        self.send_header(k, v)
-                self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", headers.get("Content-Type", ctype))
+                    self.send_header("Content-Length", str(len(data)))
+                    for k, v in headers.items():
+                        if k != "Content-Type":
+                            self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass  # the client gave up (timeout tests); nothing to report
 
             do_GET = do_POST = do_PUT = do_DELETE = _serve
 

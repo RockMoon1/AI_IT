@@ -45,11 +45,13 @@ SECRET_TOKEN = "<SECRET_REDACTED>"
 # ``author``.
 _SECRET_WORDS = (
     r"(?:passphrase|password|passwd|pwd|secret|token|api[_-]?key|apikey|"
-    r"access[_-]?key|private[_-]?key|credential|auth(?!or))"
+    r"access[_-]?key|private[_-]?key|subscription[_-]?key|account[_-]?key|shared[_-]?key|"
+    r"signing[_-]?key|master[_-]?key|client[_-]?key|credential|auth(?!or))"
 )
-# A key is a short identifier that contains one of the words above. The lazy
-# prefix is bounded so a long base64 run cannot make the scan quadratic.
-_SECRET_KEY = r"[A-Za-z0-9_.\-]{0,64}?" + _SECRET_WORDS + r"[A-Za-z0-9_.\-]*"
+# A key is a short identifier that contains one of the words above. It must
+# start at an identifier boundary and the prefix is bounded, so the scan stays
+# linear on long base64 or underscore-joined runs.
+_SECRET_KEY = r"(?<![A-Za-z0-9_.\-])[A-Za-z0-9_.\-]{0,64}?" + _SECRET_WORDS + r"[A-Za-z0-9_.\-]*"
 # A value is either quoted (anything up to the closing quote) or a bare run of
 # at least four characters that does not look like the end of the statement.
 _SECRET_VALUE = r"""(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\s"',;<>]{4,}))"""
@@ -95,7 +97,7 @@ SECRET_RULES: list[_SecretRule] = [
         (2, 3), _skip_kv),
     # KEY=value, key: value, "key": "value", --key=value
     _SecretRule("kv", re.compile(
-        r"(?i)(?<![A-Za-z0-9])[\"']?(" + _SECRET_KEY + r")[\"']?[ \t]*(?:[:=]|=>)[ \t]*" + _SECRET_VALUE),
+        r"(?i)[\"']?(" + _SECRET_KEY + r")[\"']?[ \t]*(?:[:=]|=>)[ \t]*" + _SECRET_VALUE),
         (2, 3, 4), _skip_kv),
     # command-line flags with a separate argument: -Password 'x', --token x, --api-key x
     _SecretRule("flag", re.compile(
@@ -162,9 +164,11 @@ DOB = re.compile(r"(?i)\b(?:DOB|date of birth|birth ?date)\s*[:#]?\s*(\d{1,4}[-/
 
 # Labelled values: "<label>: <value>" in text, JSON, INI or ipconfig layouts.
 # The label may carry a prefix (CsUserName, WindowsRegisteredOwner,
-# IOPlatformSerialNumber); the value is only tokened when it is labelled, so
-# unlabelled GUIDs and serial-looking strings elsewhere are left alone.
-_LABEL_PREFIX = r"[A-Za-z0-9 _-]{0,30}?"
+# IOPlatformSerialNumber), so a label may start at a word boundary or at a
+# camelCase hump; the value is only tokened when it is labelled, so unlabelled
+# GUIDs and serial-looking strings elsewhere are left alone. Anchoring on the
+# label words keeps the scan linear on large prose.
+_LABEL_START = r"(?:(?<![A-Za-z0-9])|(?-i:(?<=[a-z0-9])(?=[A-Z]))|(?-i:(?<=[A-Z])(?=[A-Z][a-z])))"
 _LABEL_SEP = r"""[ \t.]*["']?[ \t.]*(?:[:=]|\bis\b)[ \t]*"""
 _LABEL_VALUE = r"""(?:"(?P<q1>[^"\r\n]+)"|'(?P<q2>[^'\r\n]+)'|(?P<bare>[^\r\n"',;<>]+?)[ \t]*(?=[,;\r\n]|$))"""
 _LABELS = {
@@ -179,7 +183,7 @@ _LABELS = {
              r"|dns[ _-]?suffix(?:[ _-]?search[ _-]?list)?"),
 }
 LABELLED = re.compile(
-    r"(?<![A-Za-z0-9])[\"']?" + _LABEL_PREFIX
+    _LABEL_START
     + "(?:" + "|".join(f"(?P<{k}>{v})" for k, v in _LABELS.items()) + ")"
     + _LABEL_SEP + _LABEL_VALUE,
     re.I | re.M,

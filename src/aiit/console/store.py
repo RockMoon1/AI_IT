@@ -305,7 +305,7 @@ class ConsoleState:
                     continue
                 dst.write_text(red.redact(text), encoding="utf-8")
             m_red = manifest.model_dump()
-            m_red["hostname"] = red.token("HOST", manifest.hostname) if manifest.hostname else ""
+            m_red["hostname"] = red.token("HOST", manifest.hostname.lower()) if manifest.hostname else ""
             m_red["issue_description"] = red.redact(manifest.issue_description)
             m_red["audit_head"] = None
             write_json(rdir / "manifest.json", m_red)
