@@ -198,7 +198,26 @@ provider records `hosted` (data leaves the operator machine) and
   400 degrades once to the plain Messages call, and `AIIT_HIPAA_MODE=1`
   disables beta features so the request stays on the BAA-covered surface.
   `stop_reason` `refusal` is a hard stop (`ProviderRefusal`), never retried.
-  Always `hosted`; from PR 2 it requires `AIIT_ALLOW_HOSTED=1`.
+  Always `hosted`, so it needs `--allow-hosted` or `AIIT_ALLOW_HOSTED=1`.
+* `openai`, `azure-openai`, `openai-compat` and the local presets `llamacpp`,
+  `vllm`, `lmstudio`: one class over the chat-completions wire format through
+  `aiit.common.net.http_json` (no SDK). Strict JSON-schema output is requested
+  first and degrades once to `json_object`, then to free text, on a 400 that
+  names the format; `finish_reason` `length` is an error, `refusal` and
+  `content_filter` are `ProviderRefusal`. Keys come from `AIIT_OPENAI_API_KEY`,
+  `AZURE_OPENAI_API_KEY` (Azure) or `OPENAI_API_KEY`, are sent only as a
+  header and never reach the audit log; `AIIT_OPENAI_BASE_URL`,
+  `AIIT_OPENAI_MODEL`, `AIIT_AZURE_OPENAI_DEPLOYMENT`,
+  `AIIT_AZURE_OPENAI_API_VERSION`. `openai` and `azure-openai` are always
+  `hosted`; a compat server is `hosted` only when its URL is not loopback or
+  private. Bedrock and Vertex are out of scope (reachable later through the
+  Anthropic SDK's clients).
+
+Hosted providers are refused unless the operator passes `--allow-hosted`
+or sets `AIIT_ALLOW_HOSTED=1`, the HIPAA-safe default. `diagnose --fallback`
+names a second provider to try when the first fails; it may only move
+towards more privacy (hosted -> local -> `dryrun`), and the switch is
+audited as `llm_fallback`. Nothing falls back automatically.
 
 Errors are one hierarchy: `ProviderError` (transport, timeout, HTTP status,
 truncation), `ProviderRefusal` (the model declined) and

@@ -126,7 +126,7 @@ class RequestShapeTests(ServerCase):
         self.srv.queue(200, chat_reply(model="served-model"))
         p = self.compat()
         self.assertEqual(p.model, "")
-        raw, usage = p.complete_json("s", "u", {}, {})
+        _, usage = p.complete_json("s", "u", {}, {})
         self.assertNotIn("model", self.last_body())
         self.assertEqual(usage["model"], "served-model")
 
@@ -135,7 +135,7 @@ class RequestShapeTests(ServerCase):
         p = self.azure()
         self.assertTrue(p.hosted)
         self.assertEqual(p.model, "dep1")  # no AIIT_OPENAI_MODEL: the deployment names the model
-        raw, usage = p.complete_json("s", "u", {"type": "object"}, {})
+        _, usage = p.complete_json("s", "u", {"type": "object"}, {})
         req = self.srv.requests[-1]
         self.assertEqual(req["path"], "/openai/deployments/dep1/chat/completions?api-version=2024-10-21")
         self.assertEqual(req["headers"]["api-key"], KEY)
@@ -187,7 +187,7 @@ class FormatLadderTests(ServerCase):
 
     def test_degrades_to_none_then_gives_up(self):
         self.srv.queue(400, self.REJECT_SCHEMA).queue(400, self.REJECT_OBJECT).queue(200, chat_reply())
-        raw, usage = self.compat().complete_json("Answer in JSON.", "u", {"type": "object"}, {})
+        _, usage = self.compat().complete_json("Answer in JSON.", "u", {"type": "object"}, {})
         self.assertEqual(len(self.srv.requests), 3)
         self.assertNotIn("response_format", self.last_body())
         self.assertEqual(self.last_body()["messages"][0]["content"], "Answer in JSON.")  # already asks for JSON: unchanged
@@ -211,7 +211,7 @@ class FormatLadderTests(ServerCase):
 
     def test_ladder_starts_at_the_configured_mode(self):
         self.srv.queue(200, chat_reply())
-        raw, usage = self.compat(format_mode="json_object").complete_json("s", "u", {}, {})
+        _, usage = self.compat(format_mode="json_object").complete_json("s", "u", {}, {})
         self.assertEqual(self.last_body()["response_format"], {"type": "json_object"})
         self.assertEqual(usage["format_mode"], "json_object")
         self.assertFalse(usage["format_degraded"])

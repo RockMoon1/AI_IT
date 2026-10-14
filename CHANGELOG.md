@@ -142,6 +142,13 @@ PR 2, "Operators and platforms" (in progress on this branch):
   (cases, plans with risk colouring, report results, agents, audit chain
   state), no authentication surface, nothing writes. The full browser console
   (login, idle logoff, approval in the browser) is designed in the roadmap.
+- OpenAI-compatible provider: `--provider openai`, `azure-openai`,
+  `openai-compat`, or the local presets `llamacpp`, `vllm`, `lmstudio`; one
+  class over the chat-completions wire format with no SDK dependency, strict
+  JSON-schema output with a degrade ladder, keys sent only as a header and
+  never audited (`AIIT_OPENAI_BASE_URL`, `AIIT_OPENAI_MODEL`,
+  `AIIT_OPENAI_API_KEY` or `OPENAI_API_KEY`, `AIIT_AZURE_OPENAI_DEPLOYMENT`,
+  `AIIT_AZURE_OPENAI_API_VERSION`). Bedrock and Vertex stay out of scope.
 - Hosted-provider gate: a provider that sends case data off the machine is
   refused unless `--allow-hosted` or `AIIT_ALLOW_HOSTED=1` is given. An
   explicit `--fallback <provider>` on `diagnose` is tried when the first

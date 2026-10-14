@@ -16,8 +16,9 @@ ENV_KEEP = {"AIIT_TEST_INSTALLED"}
 
 
 def scrub_env() -> list[str]:
-    """Drop every AIIT_* variable (except ENV_KEEP) and ANTHROPIC_API_KEY from the process; returns what was removed."""
-    names = [k for k in os.environ if (k.startswith("AIIT_") and k not in ENV_KEEP) or k == "ANTHROPIC_API_KEY"]
+    """Drop every AIIT_* variable (except ENV_KEEP) and every provider key from the process; returns what was removed."""
+    names = [k for k in os.environ if (k.startswith("AIIT_") and k not in ENV_KEEP)
+             or k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AZURE_OPENAI_API_KEY")]
     for k in names:
         os.environ.pop(k, None)
     return names
