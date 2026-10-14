@@ -23,22 +23,40 @@ with licenses verified against each repository, is in
 
 ## Quick start (sneakernet mode)
 
-Operator machine:
+Every release on the [Releases page](https://github.com/RockMoon1/AI_IT/releases)
+ships three ways to install, all of which work with no network:
+
+| Asset | Use it when |
+|---|---|
+| `aiit-<version>-<os>-<arch>.tar.gz` (`.zip` on Windows) | The machine has no Python. Standalone `aiit-agent` and `aiit-console` for Linux x86_64, Windows x86_64, macOS arm64 and x86_64. Unsigned: verify `SHA256SUMS` first, see `docs/release-process.md`. |
+| `aiit-<version>-wheelhouse-<os>-<arch>.zip` | The machine has Python 3.10 to 3.14 but no internet: the wheel plus every dependency, installed with `pip install --no-index`. |
+| `aiit-<version>-py3-none-any.whl` | The machine has Python and can reach PyPI: `pip install aiit` fetches this same wheel. |
+
+Each release also carries `SHA256SUMS` and a build-provenance attestation
+(`gh attestation verify <file> --repo RockMoon1/AI_IT`).
+
+Operator machine (online):
 
 ```bash
-pip install -e .            # or: pip install aiit  (once published)
+pip install aiit                      # or, from a checkout: pip install -e .
 aiit-console init --label "clinic-helpdesk"
 # prints the public enrollment file to copy to endpoints
 cp .env.example ~/.aiit/console/.env   # settings live next to the console data, never in the repo
 ```
 
-Endpoint (can be offline; copy the wheel and the enrollment file over):
+Endpoint (offline; copy the wheelhouse zip or the binary archive and the
+enrollment file over on the same stick):
 
 ```bash
-pip install aiit-0.1.0-py3-none-any.whl
+unzip aiit-<version>-wheelhouse-<os>-<arch>.zip -d wheelhouse
+python -m pip install --no-index --find-links wheelhouse aiit
 aiit-agent enroll console-enrollment.json
 aiit-agent collect --issue "Outlook crashes on start since Monday" --out E:\case.aiit
 ```
+
+Without Python, unpack the binary archive instead and run `aiit-agent` from
+it (`onedir/aiit-agent/aiit-agent` is the faster-starting one-folder build);
+the commands are the same.
 
 Back on the operator machine:
 

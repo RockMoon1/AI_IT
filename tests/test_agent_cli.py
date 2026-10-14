@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import socket
 import tempfile
 import unittest
 import unittest.mock as mock
@@ -16,7 +17,7 @@ from aiit.agent.state import AgentState
 from aiit.common.crypto import Identity, sign_object
 from aiit.common.policy import Policy
 from aiit.common.schema import FixPlan, PlanStep, SignedPlan
-from aiit.common.util import in_hours, iso, read_json
+from aiit.common.util import current_os, in_hours, iso, read_json
 
 TOKEN = "unit-test-token-0123456789abcdef"
 
@@ -429,6 +430,167 @@ class ApplyTests(AgentCliBase):
         tail = self.agent("audit", "--tail", "2").splitlines()
         self.assertEqual(tail[0], "OK: 3 entries verified")
         self.assertEqual([json.loads(line)["action"] for line in tail[1:]], ["step_run", "report_written"])
+
+
+# ---------------------------------------------------------------------------
+# Field-testing metadata in collect manifests, and the selftest command.
+# ---------------------------------------------------------------------------
+SENTINEL = "sentinel-output-7731-must-not-be-printed"
+
+
+def _selftest_fakes(os_name):
+    """Three fakes: good output that embeds the hostname and a sentinel, a missing tool, a failing admin collector."""
+    host = socket.gethostname()
+    if os.name == "nt":
+        ok = ["powershell.exe", "-NoProfile", "-Command", f"Write-Output '{SENTINEL} {host}'"]
+        fails = ["powershell.exe", "-NoProfile", "-Command", f"[Console]::Error.WriteLine('{SENTINEL}'); exit 2"]
+    else:
+        ok = ["sh", "-c", f"echo '{SENTINEL} {host}'"]
+        fails = ["sh", "-c", f"echo '{SENTINEL}' >&2; exit 2"]
+    return [collectors.Collector("echo_ok", "sys", ok, "txt", 60),
+            collectors.Collector("missing_tool", "logs", ["definitely-not-a-real-command-xyz"], "txt", 5),
+            collectors.Collector("fails", "net", fails, "txt", 60, requires_admin=True)]
+
+
+class OpensBundles:
+    def open_manifest(self, path):
+        """(header, manifest dict, unpacked dir) of a bundle sealed to the test console."""
+        from aiit.common.bundle import read_bundle, unpack_to
+        hdr, plaintext = read_bundle(path, self.console.identity())
+        dest = self.root / f"open-{path.stem}"
+        unpack_to(plaintext, dest)
+        return hdr, read_json(dest / "manifest.json"), dest
+
+
+class CollectManifestTests(OpensBundles, AgentCliBase):
+    def test_manifest_carries_field_testing_metadata(self):
+        out_path = self.root / "b.aiit"
+        self.agent("collect", "--quick", "--no-osquery", "--out", str(out_path))
+        hdr, m, _ = self.open_manifest(out_path)
+        self.assertEqual(hdr["kind"], "diagnostics")
+        self.assertEqual(m["elevated"], collectors.is_elevated())
+        self.assertEqual(m["policy_sha256"], Policy.load(self.state.policy_file).digest())
+        self.assertEqual(m["policy_mode"], "dry_run")
+        self.assertFalse(m["aiit_frozen"])
+        self.assertEqual(m["collector_set"], "quick")
+        self.assertEqual(m["collector_table_sha256"], collectors.collector_table_sha256(current_os()))
+        self.assertEqual([(f["collector"], f["status"]) for f in m["files"]], [("python_platform", "ok"), ("disk_usage", "ok"), ("echo_ok", "ok")])
+        self.agent("policy", "set-mode", "enforce")
+        self.agent("collect", "--no-osquery", "--out", str(self.root / "c.aiit"))
+        _, m, _ = self.open_manifest(self.root / "c.aiit")
+        self.assertEqual((m["policy_mode"], m["collector_set"]), ("enforce", "full"))
+        rec = [e for e in self.state.audit.entries() if e["action"] == "collect"][-1]
+        self.assertEqual(rec["details"]["statuses"], {"ok": 3})
+
+
+class SelftestTests(OpensBundles, AgentCliBase):
+    def setUp(self):
+        super().setUp()
+        self.patch.stop()
+        self.patch = mock.patch.object(collectors, "collectors_for", _selftest_fakes)
+        self.patch.start()
+
+    def run_streams(self, *argv, data_dir=None):
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                agent_cli.main(["--data-dir", str(data_dir or self.adir), *argv])
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue(), err.getvalue()
+
+    def assert_metadata_only(self, text):
+        self.assertNotIn(SENTINEL, text)
+        host = socket.gethostname()
+        if len(host) >= 4:
+            self.assertNotIn(host, text)
+            self.assertNotIn(host.lower(), text.lower())
+        self.assertNotIn("definitely-not-a-real-command", text)  # command lines are never printed either
+        self.assertNotIn("Write-Output", text)
+        self.assertNotIn("echo '", text)
+
+    ROW_KEYS = {"name", "category", "requires_admin", "status", "exit_code", "duration_ms", "size", "stderr_size", "error_class"}
+
+    def test_json_report_is_metadata_only(self):
+        code, out, err = self.run_streams("selftest", "--json", "--no-osquery")
+        self.assertEqual(code, 0)
+        rep = json.loads(out)  # progress goes to stderr so stdout is one JSON document
+        self.assertIn("- sys/echo_ok", err)
+        self.assertEqual(rep["report"], "aiit-agent selftest")
+        self.assertEqual((rep["platform"], rep["collector_set"], rep["aiit_frozen"]), (current_os(), "quick", False))
+        self.assertIn(rep["elevated"], (True, False, None))
+        self.assertEqual(rep["collector_table_sha256"], collectors.collector_table_sha256(current_os()))
+        self.assertEqual((rep["total"], rep["failures"]), (5, 2))
+        self.assertEqual(rep["summary"], {"ok": 3, "nonzero": 1, "missing": 1})
+        by = {r["name"]: r for r in rep["collectors"]}
+        self.assertEqual(set(by), {"python_platform", "disk_usage", "echo_ok", "missing_tool", "fails"})
+        for r in rep["collectors"]:
+            self.assertEqual(set(r), self.ROW_KEYS)
+        self.assertEqual((by["echo_ok"]["status"], by["echo_ok"]["exit_code"], by["echo_ok"]["error_class"]), ("ok", 0, None))
+        self.assertGreater(by["echo_ok"]["size"], 0)
+        self.assertEqual((by["missing_tool"]["status"], by["missing_tool"]["category"], by["missing_tool"]["error_class"]), ("missing", "logs", "command not found"))
+        self.assertEqual((by["fails"]["status"], by["fails"]["exit_code"], by["fails"]["error_class"], by["fails"]["requires_admin"]), ("nonzero", 2, "exit 2", True))
+        self.assertGreater(by["fails"]["stderr_size"], 0)
+        self.assert_metadata_only(out)
+        self.assert_metadata_only(err)
+
+    def test_markdown_report_for_github_issues(self):
+        code, out, err = self.run_streams("selftest", "--markdown", "--no-osquery")
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("## aiit-agent selftest\n"), out[:60])
+        self.assertIn(f"| platform | {current_os()}, ", out)
+        self.assertIn("| collector set | quick (table ", out)
+        self.assertIn("**5 collectors, 2 failed**: 3 ok, 1 nonzero, 1 missing", out)
+        self.assertIn("| collector | admin | status | exit | ms | bytes | stderr bytes | error class |", out)
+        self.assertRegex(out, r"\| sys/echo_ok \|  \| ok \| 0 \| \d+ \| \d+ \| 0 \|  \|")
+        self.assertRegex(out, r"\| logs/missing_tool \|  \| missing \|  \| \d+ \| \d+ \| 0 \| command not found \|")
+        self.assertRegex(out, r"\| net/fails \| yes \| nonzero \| 2 \| \d+ \| \d+ \| [1-9]\d* \| exit 2 \|")
+        self.assert_metadata_only(out)
+
+    def test_text_report_and_strict_exit_code(self):
+        code, out, err = self.run_streams("selftest", "--no-osquery")
+        self.assertEqual(code, 0)
+        self.assertIn("5 collectors, 2 failed: 3 ok, 1 nonzero, 1 missing", out)
+        self.assertIn("net/fails", out)
+        self.assert_metadata_only(out)
+        code, out, err = self.run_streams("selftest", "--no-osquery", "--strict")
+        self.assertEqual(code, 1)
+        self.assertIn("2 failed", out)
+        with mock.patch.object(collectors, "collectors_for", lambda os_name: _selftest_fakes(os_name)[:1]):
+            code, out, err = self.run_streams("selftest", "--no-osquery", "--strict", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["failures"], 0)
+
+    def test_seal_writes_a_normal_bundle_of_the_same_run(self):
+        sealed = self.root / "selftest.aiit"
+        code, out, err = self.run_streams("selftest", "--json", "--no-osquery", "--seal", str(sealed))
+        self.assertEqual(code, 0)
+        self.assertTrue(sealed.exists())
+        self.assertIn(f"Sealed bundle of this run: {sealed}", err)
+        rep = json.loads(out)
+        hdr, m, dest = self.open_manifest(sealed)
+        self.assertEqual(hdr["kind"], "diagnostics")
+        self.assertEqual(m["issue_description"], "aiit-agent selftest")
+        self.assertEqual((m["collector_set"], m["policy_mode"]), ("quick", "dry_run"))
+        self.assertEqual(m["policy_sha256"], Policy.load(self.state.policy_file).digest())
+        self.assertEqual({f["collector"]: f["status"] for f in m["files"] if not f["collector"].endswith(".stderr")},
+                         {r["name"]: r["status"] for r in rep["collectors"]})
+        self.assertIn("net/fails.stderr.txt", [f["path"] for f in m["files"]])
+        self.assertIn(SENTINEL, (dest / "sys/echo_ok.txt").read_text())  # the bundle has the content the report left out
+        self.assertEqual(self.state.audit.entries()[-1]["action"], "selftest")
+        self.assertEqual(self.state.audit.entries()[-1]["details"]["statuses"], {"ok": 3, "nonzero": 1, "missing": 1})
+        self.assert_metadata_only(out)
+
+    def test_works_unenrolled_except_for_seal(self):
+        fresh = self.root / "fresh-agent"
+        code, out, err = self.run_streams("selftest", "--json", "--no-osquery", data_dir=fresh)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["total"], 5)
+        code, out, err = self.run_streams("selftest", "--json", "--no-osquery", "--seal", str(fresh / "x.aiit"), data_dir=fresh)
+        self.assertIn("not enrolled", str(code))
+        self.assertFalse((fresh / "x.aiit").exists())
+        code, out, err = self.run_streams("selftest", "--json", "--markdown")
+        self.assertEqual(code, 2)  # argparse: the two formats are mutually exclusive
 
 
 if __name__ == "__main__":

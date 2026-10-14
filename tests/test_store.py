@@ -181,3 +181,76 @@ class ReportIngestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# State directory protection and fingerprints (appended; kept below the __main__
+# guard on purpose so parallel appends to this file do not collide; discovery
+# loads the whole module).
+# ---------------------------------------------------------------------------
+import io  # noqa: E402
+import os  # noqa: E402
+from contextlib import redirect_stderr  # noqa: E402
+
+from aiit.agent.state import AgentState  # noqa: E402
+from aiit.common import util as _util  # noqa: E402
+from aiit.common.crypto import fingerprint  # noqa: E402
+from aiit.common.schema import Enrollment  # noqa: E402
+from aiit.console.store import ConsoleState  # noqa: E402
+
+
+class StateDirAndFingerprintTests(unittest.TestCase):
+    def test_console_root_is_created_as_the_console_owner(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = []
+            real = _util.ensure_private_dir
+
+            def spy(path, **kw):
+                calls.append((Path(path), kw))
+                return real(path, **kw)
+
+            with mock.patch("aiit.console.store.ensure_private_dir", spy):
+                st = ConsoleState(Path(d) / "console")
+            self.assertEqual(calls[0], (Path(d) / "console", {"owner": "console"}))
+            self.assertIsNone(st.identity_fingerprint())
+            st.init(label="fp")
+            fp = st.identity_fingerprint()
+            self.assertEqual(fp, fingerprint(st.public_sign_key()))
+            self.assertEqual(fp, st.identity().fingerprint)
+            self.assertRegex(fp, r"^(?:[0-9a-f]{4} ){15}[0-9a-f]{4}$")
+            # the public enrollment file carries the same key, so the endpoint can check it
+            enr = Enrollment.model_validate(read_json(st.enrollment_file))
+            self.assertEqual(fingerprint(enr.console_sign_pub), fp)
+
+    def test_agent_exposes_its_own_and_the_console_fingerprint(self):
+        with tempfile.TemporaryDirectory() as d:
+            console = helpers.make_console(Path(d) / "console")
+            calls = []
+            real = _util.ensure_private_dir
+
+            def spy(path, **kw):
+                calls.append((Path(path), kw))
+                return real(path, **kw)
+
+            with mock.patch("aiit.agent.state.ensure_private_dir", spy):
+                agent = AgentState(Path(d) / "agent")
+            self.assertEqual(calls, [(Path(d) / "agent", {"owner": "agent"})])
+            self.assertIsNone(agent.identity_fingerprint())
+            self.assertIsNone(agent.console_fingerprint())
+            ident = agent.enroll(Enrollment.model_validate(read_json(console.enrollment_file)))
+            self.assertEqual(agent.identity_fingerprint(), ident.fingerprint)
+            self.assertEqual(agent.console_fingerprint(), console.identity_fingerprint())
+            self.assertNotEqual(agent.identity_fingerprint(), agent.console_fingerprint())
+
+    @unittest.skipIf(os.name == "nt", "POSIX file modes")
+    def test_group_writable_existing_console_dir_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "console"
+            root.mkdir()
+            os.chmod(root, 0o770)  # deliberately loose: this is the misconfiguration under test
+            with self.assertRaises(PermissionError) as cm:
+                ConsoleState(root)
+            self.assertIn("chmod 700", str(cm.exception))
+            with mock.patch.dict(os.environ, {"AIIT_ALLOW_LOOSE_STATE_DIR": "1"}), redirect_stderr(io.StringIO()):
+                ConsoleState(root)
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)

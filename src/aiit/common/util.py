@@ -359,12 +359,11 @@ def _restrict_windows_state_dir(path: Path, owner: str) -> None:
 
 
 def _refuse_state_dir(path: Path, owner: str, problem: str, fix: str) -> None:
-    msg = (f"refusing {owner} state directory {path}: {problem}. Fix: {fix}, point AIIT_{owner.upper()}_DIR at a "
-           f"private directory, or set {LOOSE_STATE_DIR_ENV}=1 to accept the risk")
     if _loose_state_dir_allowed():
-        _warn(msg)
+        _warn(f"using {owner} state directory {path} although {problem} ({LOOSE_STATE_DIR_ENV}=1 is set)")
         return
-    raise PermissionError(msg)
+    raise PermissionError(f"refusing {owner} state directory {path}: {problem}. Fix: {fix}, point "
+                          f"AIIT_{owner.upper()}_DIR at a private directory, or set {LOOSE_STATE_DIR_ENV}=1 to accept the risk")
 
 
 def _check_windows_state_dir(path: Path, owner: str) -> None:

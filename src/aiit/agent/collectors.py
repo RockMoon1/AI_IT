@@ -310,14 +310,12 @@ def keep_lines(text: str, spec: tuple[str, int] | None) -> str:
     if not spec:
         return text
     mode, n = spec
+    if mode not in ("head", "tail"):
+        raise ValueError(f"keep_lines mode must be 'head' or 'tail', not {mode!r}")
     lines = text.splitlines(keepends=True)
     if len(lines) <= n:
         return text
-    if mode == "head":
-        return "".join(lines[:n])
-    if mode == "tail":
-        return "".join(lines[-n:])
-    raise ValueError(f"keep_lines mode must be 'head' or 'tail', not {mode!r}")
+    return "".join(lines[:n] if mode == "head" else lines[-n:])
 
 
 def _postprocess(c: Collector, stdout: str) -> str:
@@ -430,9 +428,9 @@ def run_one(c: Collector, out_root: Path) -> list[FileEntry]:
         status, error = "missing", f"cannot start {argv[0]}: {type(e).__name__}: {e}"
     if status == "denied" and c.requires_admin and is_elevated() is False:
         error = f"{error} (needs administrator/root; the agent is not elevated)"
-    body = stdout.encode("utf-8", "replace")
+    body = b"" if status == "empty" else stdout.encode("utf-8", "replace")
     if not body.strip() and status not in ("ok", "empty") and error:
-        body = (error + "\n").encode("utf-8")
+        body = (error + "\n").encode("utf-8")  # a failed start or a silent failure still leaves the reason in the file
     size = _write_capped(path, body)
     command = " ".join(argv)[:300]
     duration_ms = int((time.time() - started) * 1000)
