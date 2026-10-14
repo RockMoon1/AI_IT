@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import shutil
 import sys
@@ -12,7 +13,6 @@ from typing import Any
 from pydantic import ValidationError
 
 from .. import __version__
-from ..common.audit import AuditLog
 from ..common.bundle import pack_dir, write_bundle
 from ..common.crypto import CryptoError
 from ..common.net import HttpStatusError, NetError, http_json
@@ -87,16 +87,18 @@ def cmd_collect(args: argparse.Namespace) -> None:
         write_json(root / "manifest.json", manifest.model_dump())
         plaintext = pack_dir(root)
     out = Path(args.out) if args.out else st.outbox / f"{hostname()}-{bundle_id}.aiit"
-    hdr = write_bundle(out, plaintext, enr.console_box_pub, ident, kind="diagnostics", bundle_id=bundle_id, console_id=enr.console_id)
+    write_bundle(out, plaintext, enr.console_box_pub, ident, kind="diagnostics", bundle_id=bundle_id, console_id=enr.console_id)
     st.audit.record("collect", bundle_id=bundle_id, files=len(files), errors=sum(1 for f in files if f.error), out=str(out), quick=args.quick)
     st.audit.checkpoint(ident)
     print(f"Wrote {out} ({out.stat().st_size} bytes, {len(files)} files, {sum(1 for f in files if f.error)} collector errors)")
     print(f"Hand this file to the console: aiit-console ingest {out.name}")
-    if args.push:
-        _push_file(st, out, args.push, args.token)
+    if args.push and not _push_file(st, out, args.push, args.token):
+        sys.exit(EXIT_NETWORK)
 
 
-def _push_file(st: AgentState, path: Path, server: str, token: str | None) -> dict[str, Any]:
+def _push_file(st: AgentState, path: Path, server: str, token: str | None) -> bool:
+    """Upload one bundle. Returns False (after printing why and recording push_failed) instead of exiting,
+    so a caller with several files can go on with the rest."""
     from ..common.bundle import read_bundle_header
     hdr = read_bundle_header(path)
     headers = _auth_headers(token)
@@ -105,23 +107,21 @@ def _push_file(st: AgentState, path: Path, server: str, token: str | None) -> di
         body = http_json("POST", server.rstrip("/") + "/v1/bundles", raw_body=path.read_bytes(), headers=headers, timeout=120, retries=3)
     except HttpStatusError as e:
         st.audit.record("push_failed", bundle_id=hdr.get("bundle_id"), server=server, status=e.status)
-        print(f"Push failed: HTTP {e.status} {e.body_snippet[:200]}", file=sys.stderr)
+        print(f"Push failed for {path.name}: HTTP {e.status} {e.body_snippet[:200]}", file=sys.stderr)
         print(f"Bundle kept at {path}; carry it by USB or retry: aiit-agent push {path} --server {server}", file=sys.stderr)
-        sys.exit(EXIT_NETWORK)
+        return False
     except NetError as e:
         st.audit.record("push_failed", bundle_id=hdr.get("bundle_id"), server=server, error=str(e)[:200])
-        print(f"Push failed: {e}", file=sys.stderr)
+        print(f"Push failed for {path.name}: {e}", file=sys.stderr)
         print(f"Bundle kept at {path}; carry it by USB or retry: aiit-agent push {path} --server {server}", file=sys.stderr)
-        sys.exit(EXIT_NETWORK)
-    print(f"Pushed to {server}: {body}")
+        return False
+    print(f"Pushed {path.name} to {server}: {body}")
     st.audit.record("push", bundle_id=hdr.get("bundle_id"), server=server, result=body)
-    try:
+    with contextlib.suppress(OSError):  # a bundle that cannot be moved to sent/ is pushed again next time (idempotent on bundle_id)
         if path.resolve().parent == st.outbox.resolve():
             st.sent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(path), str(st.sent / path.name))
-    except OSError:
-        pass
-    return body if isinstance(body, dict) else {}
+    return True
 
 
 def cmd_push(args: argparse.Namespace) -> None:
@@ -140,7 +140,10 @@ def cmd_push(args: argparse.Namespace) -> None:
     for f in files:
         if not f.is_file():
             sys.exit(f"no such file: {f}")
-        _push_file(st, f, args.server, args.token)
+    failed = [f for f in files if not _push_file(st, f, args.server, args.token)]
+    if failed:
+        print(f"{len(failed)} of {len(files)} bundle(s) failed to push: {', '.join(f.name for f in failed)}", file=sys.stderr)
+        sys.exit(EXIT_NETWORK)
 
 
 def cmd_pull(args: argparse.Namespace) -> None:
@@ -247,7 +250,16 @@ def cmd_apply(args: argparse.Namespace) -> None:
         else:
             print("Nothing to resume for this plan.")
     elif marker and marker.get("plan_id") == sp.plan.plan_id and effective.startswith("ENFORCE"):
-        print("An earlier enforce run of this plan was interrupted; re-run with --resume to skip completed steps.", file=sys.stderr)
+        done = [str(s) for s in marker.get("completed", [])]
+        note = f"An earlier enforce run of this plan was interrupted (completed step(s): {', '.join(done) or 'none'})."
+        if not args.force_replay:
+            st.audit.record("apply_refused", plan_id=sp.plan.plan_id, problems=["interrupted enforce run; --resume or --force-replay required"])
+            print(f"{note}\nRe-run with --resume to skip the completed steps, or --force-replay to run every step again.", file=sys.stderr)
+            sys.exit(EXIT_USAGE)
+        answer = input(f"{note} Type REPLAY to run every step again from the first: ")
+        if answer.strip() != "REPLAY":
+            sys.exit("Aborted.")
+        st.audit.record("apply_replay_forced", plan_id=sp.plan.plan_id, interrupted_after=done)
     if effective.startswith("ENFORCE") and not blocked and not args.yes:
         answer = input("Type APPLY to run this plan, anything else to abort: ")
         if answer.strip() != "APPLY":
@@ -294,8 +306,8 @@ def cmd_apply(args: argparse.Namespace) -> None:
     st.audit.record("report_written", plan_id=sp.plan.plan_id, bundle_id=bundle_id, out=str(out))
     st.audit.checkpoint(ident)
     print(f"\nReport written: {out}\nReturn it to the console: aiit-console report {out.name}")
-    if args.push:
-        _push_file(st, out, args.push, args.token)
+    if args.push and not _push_file(st, out, args.push, args.token):
+        sys.exit(EXIT_NETWORK)
     if blocked and report.mode == "enforce":
         sys.exit(EXIT_POLICY)
 
@@ -369,7 +381,8 @@ def cmd_audit(args: argparse.Namespace) -> None:
         for e in st.audit.iter_filtered(plan_id=args.plan_id):
             print(f"{e['ts']}  {e['action']:22} {json.dumps(e.get('details', {}))[:120]}")
     elif sub == "repair-tail":
-        print(json.dumps(st.audit.repair_tail(), indent=2))
+        # with the agent's key the signed checkpoint is refreshed when the splice moved its offset
+        print(json.dumps(st.audit.repair_tail(identity=st.identity() if st.is_enrolled() else None), indent=2))
 
 
 # ------------------------------------------------------------------ parser
@@ -408,7 +421,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--allow-reboot", action="store_true")
     s.add_argument("--yes", action="store_true", help="skip the APPLY confirmation")
     s.add_argument("--resume", action="store_true", help="skip steps completed by an interrupted enforce run")
-    s.add_argument("--force-replay", action="store_true", help="run a plan that already ran here (asks for a typed confirmation)")
+    s.add_argument("--force-replay", action="store_true",
+                   help="run every step of a plan that already ran here, or whose enforce run was interrupted (asks for a typed confirmation)")
     s.add_argument("--out", help="report .aiit path")
     s.add_argument("--push", metavar="URL")
     s.add_argument("--token")
@@ -444,6 +458,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    for stream in (sys.stdout, sys.stderr):
+        # plan titles and step reasons carry whatever Unicode the console or the endpoint produced; a
+        # redirected stdout on Windows (cp1252) must print '?' for it rather than die with UnicodeEncodeError
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
     if args.cmd not in ("enroll",):
         try:

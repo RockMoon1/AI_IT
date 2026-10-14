@@ -123,25 +123,29 @@ class MailboxHandler(BaseHTTPRequestHandler):
         tmp = self._read_body_to_temp()
         if tmp is None:
             return
+        # The temp upload is removed before the response goes out, so a client
+        # that looks at the inbox right after the reply never sees it.
+        status, payload = 500, {"error": "internal error"}
         try:
             with self.lock:
                 case_id, manifest, _ = self.state.ingest_bundle(tmp)
-            self._json(200, {"case_id": case_id, "kind": manifest.kind, "bundle_id": manifest.bundle_id})
+            status, payload = 200, {"case_id": case_id, "kind": manifest.kind, "bundle_id": manifest.bundle_id}
         except (CryptoError, ValidationError, ValueError) as e:
-            with self.lock:
-                self.state.audit.record("serve_ingest_error", error=f"{type(e).__name__}: {str(e)[:200]}", ip=self._client_ip())
-            self._json(422, {"error": str(e)[:300]})
+            self._audit_ingest_error(e)
+            status, payload = 422, {"error": str(e)[:300]}
         except OSError as e:
-            with self.lock:
-                self.state.audit.record("serve_ingest_error", error=f"{type(e).__name__}: {str(e)[:200]}", ip=self._client_ip())
-            self._json(503, {"error": "storage error; try again later"})
+            self._audit_ingest_error(e)
+            status, payload = 503, {"error": "storage error; try again later"}
         except Exception as e:  # pragma: no cover - defensive
-            with self.lock:
-                self.state.audit.record("serve_ingest_error", error=f"{type(e).__name__}: {str(e)[:200]}", ip=self._client_ip())
-            self._json(500, {"error": "internal error"})
+            self._audit_ingest_error(e)
         finally:
             with contextlib.suppress(OSError):  # already gone or never created
                 tmp.unlink()
+        self._json(status, payload)
+
+    def _audit_ingest_error(self, e: BaseException) -> None:
+        with self.lock:
+            self.state.audit.record("serve_ingest_error", error=f"{type(e).__name__}: {str(e)[:200]}", ip=self._client_ip())
 
     def do_GET(self) -> None:
         if not self._auth():

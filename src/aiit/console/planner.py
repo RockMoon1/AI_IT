@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import shutil
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +23,29 @@ from ..common.crypto import sign_object
 from ..common.policy import Policy
 from ..common.redact import RedactionConfig, Redactor
 from ..common.schema import RISK_ORDER, FixPlan, FixPlanDraft, SignedPlan, plan_json_schema
-from ..common.util import in_hours, iso, new_id, os_user, read_json, truncate, write_json
+from ..common.util import iso, new_id, os_user, parse_iso, read_json, safe_join, truncate, utcnow, write_json
 from .llm import LLMProvider, ProviderError, ProviderOutputError, ProviderRefusal
 from .store import ConsoleState
 
 DEFAULT_PLAN_HOURS = 24.0
 MAX_PLAN_HOURS_DEFAULT = 72.0
+
+
+def check_plan_hours(hours_valid: float, max_plan_hours: float = MAX_PLAN_HOURS_DEFAULT, long_lived: bool = False) -> None:
+    """Refuse a validity window the agents' default policy would reject, unless the operator opted in.
+
+    Applied wherever a plan's lifetime is set (diagnose and approve) so the
+    console never produces a plan the endpoint will refuse as 'lifetime too long'.
+    """
+    if not hours_valid > 0:
+        raise ValueError(f"--hours {hours_valid:g} must be positive")
+    if hours_valid > max_plan_hours and not long_lived:
+        raise ValueError(f"--hours {hours_valid:g} exceeds {max_plan_hours:g}; agents refuse such plans unless you pass --long-lived and raise max_plan_hours in their policy")
+
+
+def plan_lifetime_hours(plan: FixPlan) -> float:
+    """expires_at - created_at in hours: the quantity the agent's max_plan_hours check measures."""
+    return (parse_iso(plan.expires_at) - parse_iso(plan.created_at)).total_seconds() / 3600.0
 
 SYSTEM_PROMPT = """You are a senior IT support engineer producing a repair plan for one endpoint.
 
@@ -79,9 +97,6 @@ def case_redactor(cdir: Path) -> Redactor:
     return r
 
 
-_case_redactor = case_redactor  # backwards-compatible name
-
-
 def _fence(delim: str, path: str, exit_code: Any, text: str) -> str:
     return f"\n### {path} (exit={exit_code})\n<<<AIIT-DATA-{delim}\n{text}\nAIIT-DATA-{delim}>>>\n"
 
@@ -106,13 +121,19 @@ def build_context(cdir: Path, operator_issue: str = "", max_chars: int = 150_000
     if errs:
         parts.append("Collectors that failed or returned non-zero (their output may be partial):\n" +
                      "\n".join(f"- {f['path']}: exit={f.get('exit_code')} error={f.get('error')}" for f in errs) + "\n")
+    # Previous execution reports in the order the console received them (report
+    # directories are named by random bundle id, so directory order is meaningless).
     reports_dir = cdir / "reports"
-    if reports_dir.exists():
-        for rd in sorted(p for p in reports_dir.iterdir() if not p.name.startswith(".")):
-            rj = rd / "report.json"
-            if rj.exists():
-                txt = red.redact(json.dumps(read_json(rj), indent=1))
-                parts.append(f"## Previous execution report {rd.name}\n<<<AIIT-DATA-{delim}\n{truncate(txt, per_file_cap)}\nAIIT-DATA-{delim}>>>\n")
+    reports = sorted(case.get("reports", []), key=lambda r: str(r.get("received_at", "")))
+    for i, r in enumerate(reports, 1):
+        try:
+            rj = safe_join(reports_dir, str(r.get("bundle_id", ""))) / "report.json"
+        except ValueError:
+            continue
+        if rj.exists():
+            txt = red.redact(json.dumps(read_json(rj), indent=1))
+            parts.append(f"## Previous execution report {i}/{len(reports)}: {r['bundle_id']}  plan={r.get('plan_id')}  received={r.get('received_at')}\n"
+                         f"<<<AIIT-DATA-{delim}\n{truncate(txt, per_file_cap)}\nAIIT-DATA-{delim}>>>\n")
     write_json(cdir / "redaction_map.json", red.map, private=True)
     header = "\n".join(parts)
     budget = max_chars - len(header)
@@ -171,8 +192,13 @@ def _repair_suffix(red: Redactor, delim: str, problems: list[str], raw_text: str
 
 
 def diagnose(state: ConsoleState, case_id: str, issue: str, provider: LLMProvider, max_chars: int = 150_000,
-             hours_valid: float = DEFAULT_PLAN_HOURS, repairs: int | None = None) -> tuple[FixPlan, list[str]]:
-    """Ask the provider for a plan. Returns (plan, lint_warnings). Raises ProviderError on final failure."""
+             hours_valid: float = DEFAULT_PLAN_HOURS, repairs: int | None = None, *,
+             max_plan_hours: float = MAX_PLAN_HOURS_DEFAULT, long_lived: bool = False) -> tuple[FixPlan, list[str]]:
+    """Ask the provider for a plan. Returns (plan, lint_warnings). Raises ProviderError on final failure.
+
+    Raises ValueError before any model call when hours_valid exceeds max_plan_hours and long_lived is not set.
+    """
+    check_plan_hours(hours_valid, max_plan_hours, long_lived)
     cdir = state.case_dir(case_id)
     case = read_json(cdir / "case.json")
     if repairs is None:
@@ -236,9 +262,11 @@ def diagnose(state: ConsoleState, case_id: str, issue: str, provider: LLMProvide
                             "the rejected output is saved privately at " + str(rejected) + "\n  - " + "\n  - ".join(problems[:8]))
     assert draft is not None
     warnings = lint_plan(draft, case["platform"])
+    now = utcnow()  # one instant for both stamps so the lifetime is exactly hours_valid
     plan = FixPlan(
         **draft.model_dump(), plan_id=new_id("plan-"), case_id=case_id, target_agent_id=case["agent_id"], target_os=case["platform"],
-        created_at=iso(), expires_at=in_hours(hours_valid), provider=provider.name, model=str(total_usage.get("model") or provider.model),
+        created_at=iso(now), expires_at=iso(now + timedelta(hours=hours_valid)), provider=provider.name,
+        model=str(total_usage.get("model") or provider.model),
     )
     write_json(cdir / "plans" / f"{plan.plan_id}.json", plan.model_dump(), private=True)
     case.setdefault("plans", []).append({"plan_id": plan.plan_id, "created_at": plan.created_at, "provider": plan.provider, "model": plan.model,
@@ -270,10 +298,20 @@ def approve(state: ConsoleState, case_id: str, plan_id: str, operator: str | Non
     cdir = state.case_dir(case_id)
     plan = load_plan(cdir, plan_id)
     if hours_valid is not None:
-        if hours_valid > max_plan_hours and not long_lived:
-            raise ValueError(f"--hours {hours_valid:g} exceeds {max_plan_hours:g}; agents refuse such plans unless you pass --long-lived and raise max_plan_hours in their policy")
-        plan.expires_at = in_hours(hours_valid)
+        check_plan_hours(hours_valid, max_plan_hours, long_lived)
+        # Re-date the plan: the agent measures the lifetime as expires_at - created_at,
+        # so a fresh validity window must move both stamps, not only the expiry.
+        now = utcnow()
+        plan.created_at = iso(now)
+        plan.expires_at = iso(now + timedelta(hours=hours_valid))
         write_json(cdir / "plans" / f"{plan_id}.json", plan.model_dump(), private=True)
+    else:
+        lifetime = plan_lifetime_hours(plan)
+        if lifetime > max_plan_hours and not long_lived:
+            raise ValueError(f"plan lifetime {lifetime:g} h exceeds {max_plan_hours:g}; agents refuse such plans unless you pass --long-lived "
+                             f"and raise max_plan_hours in their policy, or re-approve with --hours {max_plan_hours:g} or less")
+        if parse_iso(plan.expires_at) <= utcnow():
+            raise ValueError(f"plan expired at {plan.expires_at}; re-approve with --hours to give it a new validity window")
     ident = state.identity()
     sp = SignedPlan(
         plan=plan, signer_id=ident.id, signer_pub=ident.sign_pub_hex, approved_by=operator or os_user(), approved_at=iso(),

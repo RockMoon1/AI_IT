@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -15,7 +16,7 @@ from ..common.net import NetError
 from ..common.redact import RedactionConfig
 from ..common.util import read_json
 from .llm import PROVIDER_NAMES, ProviderError, ProviderRefusal, get_provider
-from .planner import MAX_PLAN_HOURS_DEFAULT, approve, build_context, diagnose, format_plan, load_plan, plan_warnings
+from .planner import MAX_PLAN_HOURS_DEFAULT, approve, build_context, check_plan_hours, diagnose, format_plan, load_plan, plan_warnings
 from .store import ConsoleState, default_console_dir, load_dotenv
 
 EXIT_USAGE, EXIT_PROVIDER, EXIT_VERIFY = 2, 3, 4
@@ -117,13 +118,15 @@ def cmd_diagnose(args: argparse.Namespace) -> None:
     _require_init(st)
     name = args.provider or os.environ.get("AIIT_PROVIDER") or "ollama"
     try:
+        check_plan_hours(args.hours, MAX_PLAN_HOURS_DEFAULT, args.long_lived)  # before any model call
         provider = get_provider(name, model=args.model)
-    except ProviderError as e:
+    except (ValueError, ProviderError) as e:
         sys.exit(str(e))
     max_chars = args.max_chars if args.max_chars else min(150_000, getattr(provider, "max_input_chars", 150_000))
     print(f"Diagnosing {args.case} with {provider.name}/{provider.model} (prompt budget {max_chars} chars) ...")
     try:
-        plan, warnings = diagnose(st, args.case, args.issue or "", provider, max_chars=max_chars, hours_valid=args.hours)
+        plan, warnings = diagnose(st, args.case, args.issue or "", provider, max_chars=max_chars, hours_valid=args.hours,
+                                  max_plan_hours=MAX_PLAN_HOURS_DEFAULT, long_lived=args.long_lived)
     except ProviderRefusal as e:
         print(f"Refused: {e}", file=sys.stderr)
         sys.exit(EXIT_PROVIDER)
@@ -164,8 +167,9 @@ def cmd_approve(args: argparse.Namespace) -> None:
     cdir = st.case_dir(args.case)
     warnings = plan_warnings(cdir, args.plan_id)
     print(format_plan(load_plan(cdir, args.plan_id), warnings))
-    if warnings and not args.ack_warnings and not args.yes:
-        print(f"\n{len(warnings)} warning(s) above. Pass --ack-warnings to approve anyway.")
+    if warnings and not args.ack_warnings:
+        # a hard gate, also under --yes: scripts must opt in to shipping a plan with lint warnings
+        sys.exit(f"\n{len(warnings)} warning(s) above; re-run with --ack-warnings to approve anyway.")
     if not args.yes:
         ans = input("\nSign this plan for the endpoint? Type APPROVE: ")
         if ans.strip() != "APPROVE":
@@ -277,9 +281,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     threading.Thread(target=periodic, daemon=True).start()
     try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        with contextlib.suppress(KeyboardInterrupt):  # Ctrl+C is the normal way to stop serving
+            srv.serve_forever()
     finally:
         stop.set()
         st.audit.record("serve_stop")
@@ -312,7 +315,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("case"); s.add_argument("--issue", help="what the user reports")
     s.add_argument("--provider", choices=list(PROVIDER_NAMES)); s.add_argument("--model")
     s.add_argument("--max-chars", type=int, default=0, help="prompt budget in characters (default: provider limit, at most 150000)")
-    s.add_argument("--hours", type=float, default=24.0, help="plan validity")
+    s.add_argument("--hours", type=float, default=24.0, help="plan validity (at most 72 unless --long-lived)")
+    s.add_argument("--long-lived", action="store_true", help="allow --hours above 72")
     s.set_defaults(func=cmd_diagnose)
 
     s = sub.add_parser("plans"); s.add_argument("case"); s.add_argument("--json", action="store_true"); s.set_defaults(func=cmd_plans)
@@ -350,9 +354,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Bundle-derived text routinely carries U+FFFD and arbitrary Unicode; on Windows a
+    # redirected stdout is the ANSI code page, so never let an unencodable character abort a command.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass  # not a TextIOWrapper (StringIO in tests) or already detached
     args = build_parser().parse_args(argv)
     root = Path(args.data_dir) if args.data_dir else default_console_dir()
-    load_dotenv(explicit=Path(args.env_file) if args.env_file else None, console_dir=root)
+    try:
+        load_dotenv(explicit=Path(args.env_file) if args.env_file else None, console_dir=root)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(EXIT_USAGE)
     if args.cmd not in ("init",):
         try:
             st = ConsoleState(root)

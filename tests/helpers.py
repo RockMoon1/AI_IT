@@ -10,7 +10,20 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-os.environ.pop("AIIT_KEY_PASSPHRASE", None)
+# The suite must not see the developer's own AIIT_* settings (alert sinks, env files, retry counts,
+# data dirs) or a real API key. Only CI's AIIT_TEST_INSTALLED marker is kept.
+ENV_KEEP = {"AIIT_TEST_INSTALLED"}
+
+
+def scrub_env() -> list[str]:
+    """Drop every AIIT_* variable (except ENV_KEEP) and ANTHROPIC_API_KEY from the process; returns what was removed."""
+    names = [k for k in os.environ if (k.startswith("AIIT_") and k not in ENV_KEEP) or k == "ANTHROPIC_API_KEY"]
+    for k in names:
+        os.environ.pop(k, None)
+    return names
+
+
+scrub_env()
 
 
 def echo_cmd(text: str) -> str:
@@ -23,6 +36,17 @@ def fail_cmd(code: int = 3) -> str:
 
 def sleep_cmd(seconds: int) -> str:
     return f"Start-Sleep -Seconds {seconds}" if os.name == "nt" else f"sleep {seconds}"
+
+
+def tamper_audit_line(path, index: int, mutate) -> None:
+    """Rewrite physical line ``index`` (0-based) of an audit log in place after ``mutate(entry)`` changed it."""
+    import json
+    path = Path(path)
+    lines = path.read_bytes().split(b"\n")
+    e = json.loads(lines[index])
+    mutate(e)
+    lines[index] = json.dumps(e, sort_keys=True).encode("utf-8")
+    path.write_bytes(b"\n".join(lines))
 
 
 # ---------------------------------------------------------------------------

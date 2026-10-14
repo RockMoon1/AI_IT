@@ -128,8 +128,8 @@ def http_json(
                 snippet = e.read(512).decode("utf-8", "replace")
             except Exception:  # nosec B110 - the status is the error; an unreadable body only loses the snippet
                 snippet = ""
-            ra = e.headers.get("Retry-After") if e.headers else None
             if e.code in retry_statuses and attempt <= retries:
+                ra = e.headers.get("Retry-After") if e.headers else None
                 if ra and ra.strip().isdigit():
                     retry_after = float(ra.strip())
                     if retry_after > RETRY_AFTER_MAX:

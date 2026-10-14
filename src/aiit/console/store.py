@@ -28,8 +28,17 @@ from ..common.schema import BundleManifest, Enrollment, ExecutionReport
 from ..common.util import (ensure_private_dir, file_lock, iso, new_id, read_json, safe_join, sha256_file,
                            validate_id, write_json, write_private_file)
 
+# Built-in and generic account names that are never worth tokening, plus short
+# English words that double as service-account names: tokening those would hit
+# every "information", "database" or "template" in the logs for no privacy gain.
 USERNAME_STOPLIST = {"administrator", "guest", "defaultaccount", "wdagutilityaccount", "root", "system", "public",
-                     "default", "nobody", "daemon", "local service", "network service", "admin", "user", "test"}
+                     "default", "nobody", "daemon", "local service", "network service", "admin", "user", "test",
+                     "info", "data", "temp", "tmp", "demo", "sample", "example", "backup", "support", "service",
+                     "services", "scan", "scanner", "print", "printer", "office", "reception", "front", "desk",
+                     "sales", "shared", "share", "local", "remote", "network", "home", "mail", "email", "web",
+                     "www", "ftp", "sql", "oracle", "postgres", "mysql", "kiosk", "help", "helpdesk", "none",
+                     "null", "true", "false", "name", "unknown", "other", "owner", "users", "staff", "student"}
+USERNAME_MIN_LENGTH = 4
 
 
 def load_dotenv(explicit: Path | None = None, console_dir: Path | None = None) -> Path | None:
@@ -39,12 +48,22 @@ def load_dotenv(explicit: Path | None = None, console_dir: Path | None = None) -
     variables win. AIIT_CONSOLE_DIR is ignored inside the file (it decides where
     the file lives, so it cannot come from the file). On POSIX a group- or
     world-writable file is refused. Returns the path that was loaded, if any.
+
+    A file the operator named explicitly (the argument or AIIT_ENV_FILE) that
+    does not exist raises FileNotFoundError: a typo must not silently run the
+    command without its settings. The default <console_dir>/.env is optional.
     """
     candidates: list[Path] = []
     if explicit:
-        candidates.append(Path(explicit))
+        p = Path(explicit)
+        if not p.is_file():
+            raise FileNotFoundError(f"--env-file {p} does not exist or is not a file")
+        candidates.append(p)
     elif os.environ.get("AIIT_ENV_FILE"):
-        candidates.append(Path(os.environ["AIIT_ENV_FILE"]))
+        p = Path(os.environ["AIIT_ENV_FILE"])
+        if not p.is_file():
+            raise FileNotFoundError(f"AIIT_ENV_FILE={p} does not exist or is not a file")
+        candidates.append(p)
     elif console_dir is not None:
         candidates.append(Path(console_dir) / ".env")
     loaded: Path | None = None
@@ -94,7 +113,7 @@ def _harvest_usernames(raw: Path) -> list[str]:
             add(m.group(1))
             v = m.group(2)
         v = v.strip()
-        if len(v) >= 4 and v.lower() not in USERNAME_STOPLIST and not v.isdigit():
+        if len(v) >= USERNAME_MIN_LENGTH and v.lower() not in USERNAME_STOPLIST and not v.isdigit():
             found.add(v)
 
     def walk(obj: Any, keys: set[str]) -> None:

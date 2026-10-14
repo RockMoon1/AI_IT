@@ -493,10 +493,11 @@ class Redactor:
         # 1. secrets first (irreversible)
         for rule in SECRET_RULES:
             text = self._apply_secret(rule, text)
-        # 2. operator-supplied literals (names, etc.)
+        # 2. operator-supplied literals (names, etc.): word-bounded, exact case, so an
+        #    account called "mark" or "info" does not corrupt "bookmarks" or "information"
         for lit in self.config.extra_literals:
             if lit and lit in text:
-                text = text.replace(lit, self.token("NAME", lit))
+                text = self._sub_literal(text, lit, "NAME")
         # 3. structured identifiers
         text = self._sub(MRN, "MRN", text, group=1)
         text = self._sub(DOB, "DOB", text, group=1)

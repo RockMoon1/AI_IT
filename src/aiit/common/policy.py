@@ -287,8 +287,10 @@ _SEG_SPLIT_RE = re.compile(r"\s*(?:\|\|?|&&?|;|\r?\n)\s*")
 # and ``<>`` out; descriptor duplication (``2>&1``) is folded away before use.
 _REDIR_RE = re.compile(r"(?:^|[^<>=\-])\d*>>?\s*([^\s;&|<>]+)?")
 _NULL_TARGET_RE = re.compile(r"^(?:/dev/null|\$null|nul)$", re.I)
+# These are match patterns for paths found in commands, not temp paths the
+# tool itself uses, so bandit's hardcoded-tmp check (B108) does not apply.
 _TEMP_TARGET_RE = re.compile(
-    r"/tmp/|/var/tmp/|/private/tmp/|/var/folders/|/private/var/folders/|\$tmpdir\b|\$env:te?mp\b|%te?mp%"
+    r"/tmp/|/var/tmp/|/private/tmp/|/var/folders/|/private/var/folders/|\$tmpdir\b|\$env:te?mp\b|%te?mp%"  # nosec B108
     r"|[a-z]:[\\/](?:temp|tmp)[\\/]|[a-z]:[\\/]windows[\\/]temp[\\/]|[\\/]appdata[\\/]local[\\/]temp[\\/]"
     r"|^~/|^\$home/|^\$env:userprofile[\\/]|^%userprofile%[\\/]",
     re.I)

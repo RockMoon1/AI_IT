@@ -51,15 +51,22 @@ class AnthropicProvider(LLMProvider):
         """Returns (response, fallbacks_degraded)."""
         import anthropic
 
+        degraded = False
         if self.fallbacks:
             try:
                 # Server-side refusal fallback (Claude API only): if a safety classifier declines,
                 # the request is re-run on a fallback model inside the same call.
                 return client.beta.messages.create(betas=["server-side-fallback-2026-07-01"], fallbacks="default", **kwargs), False
-            except anthropic.BadRequestError:
-                # the org or platform does not accept the beta: run the plain request once
-                return client.messages.create(**kwargs), True
-        return client.messages.create(**kwargs), False
+            except (anthropic.BadRequestError, TypeError):
+                # BadRequestError: the org or platform does not accept the beta.
+                # TypeError: the installed SDK predates the `fallbacks`/`betas` keywords.
+                # Either way run the plain request once.
+                degraded = True
+        try:
+            return client.messages.create(**kwargs), degraded
+        except TypeError as e:
+            # unexpected keyword argument: the SDK is too old for structured output
+            raise ProviderError(f"anthropic SDK too old for output_config (structured output): {e}; pip install -U anthropic") from e
 
     def complete_json(self, system: str, user: str, schema: dict[str, Any], meta: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         import anthropic

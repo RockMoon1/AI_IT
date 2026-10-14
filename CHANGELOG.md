@@ -31,6 +31,20 @@ signed plan wire formats; existing bundles and plans remain readable.
 - Policy engine: a locally computed risk floor (`effective_risk = max(declared,
   floor)`) so a mislabelled "read_only" step that runs a mutating verb cannot
   slip under `max_risk`. Sites can tighten it with `risk_floor_overrides`.
+- Policy engine: the floor is computed per separator-free segment and the
+  maximum wins, so a read verb in front (`ls; chmod 777 /etc/x`) no longer
+  hides a mutating command behind it. Output redirection and writer verbs
+  (`tee`, `Out-File`, `Set-Content`) count as writes: temp and home targets
+  floor to `low`, anything else to `medium`.
+- Policy engine: writes to protected files and keys are structural denies at
+  any `max_risk` (passwd, group, sudoers, ssh, PAM, cron, systemd and launchd
+  units, shell profiles, `$PROFILE`, Startup folders, Run keys, Winlogon,
+  LSA, Defender, boot and EFI, kernel modules, CA stores, System32 outside
+  the usual cleanup targets); reads stay allowed. Credential stores (shadow,
+  private keys, SAM/SECURITY hives, keychains, lsass, cloud and database
+  credential files) are never touched, and `chmod` with a setuid/setgid bit
+  is refused. `${HOME}`, `$env:USERPROFILE` and `%USERPROFILE%` count as home
+  roots for the recursive-delete rule.
 - Policy engine: many new deny families (Defender, firewall, BitLocker and
   event-log tampering, persistence keys, `find / -delete`, `iptables -F`,
   `nft flush`, sudoers, `passwd -d`, `diskutil secureErase`, `tmutil delete`,
@@ -65,6 +79,11 @@ signed plan wire formats; existing bundles and plans remain readable.
   Collected files are wrapped in data fences with a per-request random
   delimiter and the system prompt declares fenced content to be data, not
   instructions.
+- Redaction: a spaced `-p VALUE` is treated as a password unless the command
+  is a known port/pid/path tool or the value is a number or path; credential
+  flags of common clients (`sqlcmd -P`, `ldapsearch -w`, `redis-cli -a`,
+  `smbclient -U user%pass`, `openssl pass:`, `schtasks /rp`, `/pass:`,
+  `net use`, `curl -u user:pass`) are replaced irreversibly.
 - Redaction: closed gaps for key/value secrets with underscores and
   `passphrase`, URL userinfo, `Authorization: Basic`, JWTs, `--password`
   flags, IPv6, JSON-escaped Windows user paths, `DOMAIN\user`, SIDs, UNC
