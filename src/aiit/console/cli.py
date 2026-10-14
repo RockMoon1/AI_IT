@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import sys
+import tarfile
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -13,13 +14,15 @@ from pydantic import ValidationError
 from .. import __version__
 from ..common.crypto import CryptoError
 from ..common.net import NetError
+from ..common import term
 from ..common.redact import RedactionConfig
 from ..common.util import read_json
 from .llm import PROVIDER_NAMES, ProviderError, ProviderRefusal, get_provider
-from .planner import MAX_PLAN_HOURS_DEFAULT, approve, build_context, check_plan_hours, diagnose, format_plan, load_plan, plan_warnings
+from .planner import (MAX_PLAN_HOURS_DEFAULT, approve, build_context, check_fallback_more_private, check_hosted_allowed,
+                      check_plan_hours, diagnose, format_plan, load_plan, plan_warnings)
 from .store import ConsoleState, default_console_dir, load_dotenv
 
-EXIT_USAGE, EXIT_PROVIDER, EXIT_VERIFY = 2, 3, 4
+EXIT_USAGE, EXIT_PROVIDER, EXIT_VERIFY, EXIT_INTERRUPT = 2, 3, 4, 130
 
 
 def _state(args: argparse.Namespace) -> ConsoleState:
@@ -113,6 +116,10 @@ def cmd_preview(args: argparse.Namespace) -> None:
     print(f"\n[{len(ctx)} chars, {len(included)} files would be sent to the model]", file=sys.stderr)
 
 
+def _hosted_allowed(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "allow_hosted", False)) or os.environ.get("AIIT_ALLOW_HOSTED", "").strip().lower() in ("1", "true", "yes")
+
+
 def cmd_diagnose(args: argparse.Namespace) -> None:
     st = _state(args)
     _require_init(st)
@@ -120,19 +127,39 @@ def cmd_diagnose(args: argparse.Namespace) -> None:
     try:
         check_plan_hours(args.hours, MAX_PLAN_HOURS_DEFAULT, args.long_lived)  # before any model call
         provider = get_provider(name, model=args.model)
+        check_hosted_allowed(provider, _hosted_allowed(args))
+        fallback = get_provider(args.fallback) if args.fallback else None
+        if fallback is not None:
+            check_fallback_more_private(provider, fallback)
     except (ValueError, ProviderError) as e:
         sys.exit(str(e))
-    max_chars = args.max_chars if args.max_chars else min(150_000, getattr(provider, "max_input_chars", 150_000))
-    print(f"Diagnosing {args.case} with {provider.name}/{provider.model} (prompt budget {max_chars} chars) ...")
+
+    def run(p):
+        max_chars = args.max_chars if args.max_chars else min(150_000, getattr(p, "max_input_chars", 150_000))
+        print(f"Diagnosing {args.case} with {p.name}/{p.model} (prompt budget {max_chars} chars"
+              f"{', hosted' if getattr(p, 'hosted', False) else ''}) ...")
+        with term.Spinner(f"Waiting for {p.name}", stream=sys.stderr):
+            return diagnose(st, args.case, args.issue or "", p, max_chars=max_chars, hours_valid=args.hours,
+                            max_plan_hours=MAX_PLAN_HOURS_DEFAULT, long_lived=args.long_lived)
+
     try:
-        plan, warnings = diagnose(st, args.case, args.issue or "", provider, max_chars=max_chars, hours_valid=args.hours,
-                                  max_plan_hours=MAX_PLAN_HOURS_DEFAULT, long_lived=args.long_lived)
-    except ProviderRefusal as e:
-        print(f"Refused: {e}", file=sys.stderr)
-        sys.exit(EXIT_PROVIDER)
+        plan, warnings = run(provider)
     except ProviderError as e:
-        print(f"Provider error: {e}", file=sys.stderr)
-        sys.exit(EXIT_PROVIDER)
+        if fallback is None:
+            label = "Refused" if isinstance(e, ProviderRefusal) else "Provider error"
+            term.report_error(str(e), None if isinstance(e, ProviderRefusal) else
+                              "pass --fallback dryrun for an offline read-only checklist, or fix the provider and retry",
+                              label=label)
+            sys.exit(EXIT_PROVIDER)
+        st.audit.record("llm_fallback", case_id=args.case, from_provider=provider.name, to_provider=fallback.name,
+                        reason=f"{type(e).__name__}: {str(e)[:200]}")
+        print(f"{provider.name} failed ({str(e).splitlines()[0][:120]}); falling back to {fallback.name}", file=sys.stderr)
+        try:
+            plan, warnings = run(fallback)
+        except ProviderError as e2:
+            term.report_error(f"fallback {fallback.name} failed too: {e2}", label="Provider error")
+            sys.exit(EXIT_PROVIDER)
+        warnings = list(warnings) + [f"produced by the fallback provider {fallback.name} after {provider.name} failed"]
     st.audit.checkpoint(st.identity())
     print(format_plan(plan, warnings))
     print(f"\nSaved. Approve with: aiit-console approve {args.case} {plan.plan_id} --out <usb-dir>")
@@ -198,9 +225,12 @@ def cmd_report(args: argparse.Namespace) -> None:
     if manifest.kind != "execution_report":
         sys.exit(f"That file is a {manifest.kind} bundle, not a report (it was ingested as case {case_id})")
     rep = read_json(st.case_dir(case_id) / "reports" / manifest.bundle_id / "report.json")
+    if getattr(args, "json", False):
+        print(json.dumps({"case_id": case_id, "bundle_id": manifest.bundle_id, **rep}, indent=2))
+        return
     print(f"Case {case_id} plan {rep['plan_id']} mode={rep['mode']} on {rep['hostname']}:")
     for r in rep["results"]:
-        line = f"  [{r['step_id']}] {r['status']:17} {r['title']}"
+        line = f"  [{r['step_id']}] {term.status_label(r['status'], 17)} {r['title']}"
         if r.get("exit_code") is not None:
             line += f" exit={r['exit_code']}"
         if r.get("reason"):
@@ -289,11 +319,30 @@ def cmd_serve(args: argparse.Namespace) -> None:
         st.audit.record("serve_stop")
 
 
+def cmd_dashboard(args: argparse.Namespace) -> None:
+    from .dashboard import make_dashboard_server
+    st = _state(args)
+    _require_init(st)
+    try:
+        srv = make_dashboard_server(st, args.host, args.port)
+    except (ValueError, OSError) as e:
+        sys.exit(str(e))
+    print(f"aiit-console dashboard (read-only) on http://{args.host}:{srv.server_address[1]}/  (Ctrl+C to stop)")
+    st.audit.record("dashboard_start", host=args.host, port=srv.server_address[1])
+    try:
+        with contextlib.suppress(KeyboardInterrupt):  # Ctrl+C is the normal way to stop
+            srv.serve_forever()
+    finally:
+        srv.server_close()
+        st.audit.record("dashboard_stop")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="aiit-console", description="AI_IT operator console")
     p.add_argument("--data-dir", help="state directory (default: AIIT_CONSOLE_DIR or ~/.aiit/console)")
     p.add_argument("--env-file", help="settings file to load (default: <data dir>/.env or AIIT_ENV_FILE)")
     p.add_argument("--debug", action="store_true", help="show tracebacks")
+    p.add_argument("--no-color", action="store_true", help="plain output (also NO_COLOR=1)")
     p.add_argument("--version", action="version", version=f"aiit-console {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -318,6 +367,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-chars", type=int, default=0, help="prompt budget in characters (default: provider limit, at most 150000)")
     s.add_argument("--hours", type=float, default=24.0, help="plan validity (at most 72 unless --long-lived)")
     s.add_argument("--long-lived", action="store_true", help="allow --hours above 72")
+    s.add_argument("--allow-hosted", action="store_true", help="permit a provider that sends case data off this machine (or AIIT_ALLOW_HOSTED=1)")
+    s.add_argument("--fallback", choices=list(PROVIDER_NAMES), help="provider to try if the first one fails; must be at least as private")
     s.set_defaults(func=cmd_diagnose)
 
     s = sub.add_parser("plans"); s.add_argument("case"); s.add_argument("--json", action="store_true"); s.set_defaults(func=cmd_plans)
@@ -330,6 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_approve)
 
     s = sub.add_parser("report", help="attach an execution report bundle to its case")
+    s.add_argument("--json", action="store_true", help="print the report as JSON")
     s.add_argument("bundle"); s.add_argument("-v", "--verbose", action="store_true"); s.set_defaults(func=cmd_report)
 
     s = sub.add_parser("agents"); s.add_argument("--json", action="store_true"); s.set_defaults(func=cmd_agents)
@@ -344,6 +396,11 @@ def build_parser() -> argparse.ArgumentParser:
     asub.add_parser("repair-tail")
     s.set_defaults(func=cmd_audit)
     s = sub.add_parser("audit-verify", help="alias for: audit verify"); s.add_argument("--tail", type=int, default=0); s.set_defaults(func=cmd_audit, audit_cmd="verify")
+
+    s = sub.add_parser("dashboard", help="read-only status page on localhost")
+    s.add_argument("--host", default="127.0.0.1", help="loopback only; any other host is refused")
+    s.add_argument("--port", type=int, default=8788)
+    s.set_defaults(func=cmd_dashboard)
 
     s = sub.add_parser("serve", help="LAN mailbox for agents")
     s.add_argument("--host", default="0.0.0.0"); s.add_argument("--port", type=int, default=8787)
@@ -363,6 +420,8 @@ def main(argv: list[str] | None = None) -> None:
         except (AttributeError, ValueError):
             pass  # not a TextIOWrapper (StringIO in tests) or already detached
     args = build_parser().parse_args(argv)
+    if args.no_color:
+        term.set_color(False)
     root = Path(args.data_dir) if args.data_dir else default_console_dir()
     try:
         load_dotenv(explicit=Path(args.env_file) if args.env_file else None, console_dir=root)
@@ -380,21 +439,42 @@ def main(argv: list[str] | None = None) -> None:
             print(f"warning: audit check skipped: {type(e).__name__}", file=sys.stderr)
     try:
         args.func(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(EXIT_INTERRUPT)
+    except EOFError:
+        term.report_error("no answer on stdin (not a terminal?)", "run interactively, or pass --yes where the command supports it")
+        sys.exit(EXIT_USAGE)
     except CryptoError as e:
         if args.debug:
             raise
-        print(f"error: {e}", file=sys.stderr)
+        term.report_error(str(e), "the file may be for another console, tampered, or sealed with a newer version")
         sys.exit(EXIT_VERIFY)
+    except ProviderRefusal as e:
+        if args.debug:
+            raise
+        term.report_error(str(e), label="refused")
+        sys.exit(EXIT_PROVIDER)
     except (ProviderError, NetError) as e:
         if args.debug:
             raise
-        print(f"error: {e}", file=sys.stderr)
+        term.report_error(str(e), "check the provider URL, key and model; --fallback dryrun gives an offline checklist")
         sys.exit(EXIT_PROVIDER)
+    except tarfile.TarError as e:
+        if args.debug:
+            raise
+        term.report_error(f"bundle archive is damaged: {e}", "re-collect on the endpoint; the agent keeps a copy in its outbox")
+        sys.exit(EXIT_VERIFY)
     except (ValidationError, ValueError, FileNotFoundError) as e:
         if args.debug:
             raise
-        print(f"error: {str(e).splitlines()[0][:300]}", file=sys.stderr)
+        term.report_error(str(e), "run with --debug for the full traceback")
         sys.exit(EXIT_USAGE)
+    except OSError as e:
+        if args.debug:
+            raise
+        term.report_error(f"{type(e).__name__}: {e}", "check disk space and permissions on the console directory")
+        sys.exit(1)
 
 
 if __name__ == "__main__":  # pragma: no cover
