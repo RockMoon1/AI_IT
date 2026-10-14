@@ -10,6 +10,15 @@ from .util import ID_RE
 
 OSName = Literal["windows", "linux", "macos", "any"]
 Risk = Literal["read_only", "low", "medium", "high"]
+# Outcome of one collector run, classified by the agent at collection time:
+#   ok            exit 0 with output (and valid JSON when the file is .json)
+#   nonzero       the tool exited non-zero without a recognised reason
+#   timeout       killed after the collector's timeout; partial output kept
+#   missing       the tool could not be started or reported "not found"
+#   denied        the tool reported an access/permission/elevation error
+#   empty         exit 0 but no output (often healthy: "no failed devices")
+#   invalid_json  a .json collector produced text that does not parse
+FileStatus = Literal["ok", "nonzero", "timeout", "missing", "denied", "empty", "invalid_json"]
 RISK_ORDER: dict[str, int] = {"read_only": 0, "low": 1, "medium": 2, "high": 3}
 
 # Ids minted by util.new_id look like "case-3f9a1c2b7d4e". Anything else that
@@ -35,6 +44,16 @@ def validate_relative_path(value: str) -> str:
 
 
 class FileEntry(BaseModel):
+    """One file inside a diagnostics bundle.
+
+    ``status`` is the agent's classification of the collector run (see
+    ``FileStatus``); ``error`` keeps the human readable reason. Manifests
+    written before ``status`` existed load with ``"ok"``; for those,
+    ``error`` and ``exit_code`` remain the authoritative failure signal. A
+    collector's stderr is stored as a sidecar ``<category>/<name>.stderr.txt``
+    with its own entry whose ``collector`` is ``<name>.stderr``.
+    """
+
     path: str
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     size: int
@@ -43,6 +62,7 @@ class FileEntry(BaseModel):
     exit_code: int | None = None
     duration_ms: int = 0
     error: str | None = None
+    status: FileStatus = "ok"
 
     @field_validator("path")
     @classmethod
@@ -65,6 +85,13 @@ class BundleManifest(BaseModel):
     plan_id: IdStr | None = None
     files: list[FileEntry] = Field(default_factory=list, max_length=2000)
     audit_head: dict[str, Any] | None = None
+    # Field-testing metadata (all optional; bundles from older agents omit them).
+    elevated: bool | None = None            # agent ran as administrator/root (None: could not tell)
+    policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")  # Policy.digest() at collection time
+    policy_mode: Literal["dry_run", "enforce"] | None = None
+    aiit_frozen: bool = False               # agent is a frozen (PyInstaller-style) executable
+    collector_set: Literal["quick", "full"] | None = None
+    collector_table_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")  # digest of the collector table used
 
 
 class PlanStep(BaseModel):

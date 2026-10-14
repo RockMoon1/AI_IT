@@ -253,7 +253,48 @@ are passed through the case's redactor before they enter the prompt.
   MeshCentral (Apache-2.0) for screen, terminal and files. AI_IT does not
   replace that; it feeds it.
 
-## 8. Threats considered
+## 8. Read-only dashboard
+
+`aiit-console dashboard` (module `aiit.console.dashboard`) serves one
+self-contained HTML page over the console directory so an operator can keep a
+browser tab open while working in the terminal: the cases table (id, created,
+hostname token, platform, agent, trust state, plan and report counts, last
+activity), one page per case with every plan (steps, risk colouring, lint
+warnings, approval state) and every execution report (per-step status, exit
+code, reason), the enrolled agents with their last-seen time and witnessed
+audit head, the console id, and the audit chain verdict with the signed
+checkpoint seq. The page refreshes itself every 15 s with a `<meta>` tag.
+
+Its trust boundary is deliberately narrow:
+
+* **Loopback only.** `make_dashboard_server` binds to `127.0.0.1` or `::1`
+  and raises `ValueError` for any other host, including `localhost` (a hosts
+  file can point that anywhere). There is no authentication: whoever can
+  reach the port is already the operator at this machine, the same person who
+  can run the CLI against the same directory. Putting it behind a reverse
+  proxy or an SSH tunnel is outside the design; the full console in
+  `docs/roadmap.md` is the answer for remote or multi-operator use.
+* **Nothing writes.** Only `GET` and `HEAD` are served; every other method is
+  `405`. The audit chain is checked with `AuditLog.verify`, never with
+  `check_and_alert`, so a page load neither appends an `audit_chain_broken`
+  entry nor fires the alert sinks, and no file under the console directory is
+  created or modified. `tests/test_dashboard.py` asserts that the log and the
+  checkpoint are byte-identical after a series of requests.
+* **Nothing executes.** The page carries no script; its
+  `Content-Security-Policy` is `default-src 'none'; style-src 'unsafe-inline'`,
+  with `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  `Cache-Control: no-store` and `X-Frame-Options: DENY` on every response.
+  Every value that came from a bundle, a model answer or an operator (ids,
+  hostnames, commands, titles, rationales, reasons) passes through
+  `html.escape`. Raw collected files and command output are never rendered;
+  where a redacted form exists (the hostname token, the issue text) the page
+  shows that form.
+* **Same data as the CLI.** The page is built from `ConsoleState.list_cases`,
+  `ConsoleState.agents`, `planner.load_plan` and the case's `reports/` entries,
+  the same helpers behind `cases`, `plans`, `plan`, `report` and `agents`, so
+  it cannot disagree with the terminal.
+
+## 9. Threats considered
 
 The threat model lives in `docs/security/threat-model.md`. It is organised
 by STRIDE and lists, for every threat, the control, the file and function

@@ -136,6 +136,24 @@ signed plan wire formats; existing bundles and plans remain readable.
 
 ### Added
 
+PR 2, "Operators and platforms" (in progress on this branch):
+
+- `aiit-console dashboard`: a read-only status page bound to loopback only
+  (cases, plans with risk colouring, report results, agents, audit chain
+  state), no authentication surface, nothing writes. The full browser console
+  (login, idle logoff, approval in the browser) is designed in the roadmap.
+- Hosted-provider gate: a provider that sends case data off the machine is
+  refused unless `--allow-hosted` or `AIIT_ALLOW_HOSTED=1` is given. An
+  explicit `--fallback <provider>` on `diagnose` is tried when the first
+  provider fails; it may only move towards a more private provider
+  (hosted -> local -> dryrun) and is audited as `llm_fallback`. A truncated
+  model context is reported as a plan warning.
+- Terminal output: colour that honours `NO_COLOR`, `FORCE_COLOR` and the
+  Windows console, risk and status labels, a spinner while the model works,
+  `--no-color`, `--json` on `report`. Errors print one line with a hint
+  (traceback only with `--debug`); exit codes 2 usage, 3 provider or
+  network, 4 verification, 130 interrupted.
+
 - `aiit-agent push <file|--outbox>` to upload bundles or reports that were
   kept locally after a failed push; `AIIT_SERVER_TOKEN_FILE` as an
   alternative to the environment variable; on push failure the bundle is kept

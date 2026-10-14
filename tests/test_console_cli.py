@@ -484,3 +484,17 @@ class OutputAndErrorSurfaceTests(ConsoleCliBase):
         with mock.patch.object(console_cli, "cmd_cases", side_effect=OSError(5, "io")):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), self.assertRaises(OSError):
                 console_cli.main(["--data-dir", str(self.cdir), "--debug", "cases"])
+
+
+class DashboardCommandTests(ConsoleCliBase):
+    def test_dashboard_refuses_non_loopback_and_audits_a_run(self):
+        code, out = self.console_exit("dashboard", "--host", "0.0.0.0", "--port", "0")
+        self.assertIn("127.0.0.1", out)
+        from aiit.console import dashboard
+        with mock.patch.object(dashboard.DashboardServer, "serve_forever", side_effect=KeyboardInterrupt):
+            out = self.console("dashboard", "--port", "0")
+        self.assertIn("read-only", out)
+        self.assertIn("http://127.0.0.1:", out)
+        actions = [e["action"] for e in self.state.audit.entries()]
+        self.assertIn("dashboard_start", actions)
+        self.assertEqual(actions[-1], "dashboard_stop")
