@@ -287,8 +287,9 @@ class RedactionConfig:
     ``redact_public_ips`` / ``redact_private_ips`` apply to IPv4 and IPv6
     alike; loopback and link-local addresses are never tokened.
     ``redact_hostnames`` are matched case-insensitively on word boundaries.
-    ``extra_literals`` are replaced verbatim wherever they occur (for known
-    patient or staff names the operator adds).
+    ``extra_literals`` (known patient or staff names the operator adds, plus
+    the account names harvested at ingest) are replaced wherever they occur as
+    whole words, case preserved, so ``mark`` never touches ``bookmarks``.
     """
 
     redact_public_ips: bool = True

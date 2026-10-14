@@ -172,6 +172,22 @@ signed plan wire formats; existing bundles and plans remain readable.
   scripted `FakeHTTP` server in `tests/helpers.py`.
 
 ### Changed
+- Console `approve` refuses a plan that carries lint warnings unless
+  `--ack-warnings` is given (it used to print the warnings and sign anyway,
+  even with `--yes`). `diagnose --hours` is capped by the policy's
+  `max_plan_hours` unless `--long-lived` is given, and `approve --hours`
+  re-dates both `created_at` and `expires_at` so the endpoint's lifetime
+  check agrees with the console's.
+- Console: an explicit `--env-file` or `AIIT_ENV_FILE` that does not exist is
+  a usage error instead of being ignored. Previous execution reports are fed
+  to the model in the order they were received. Harvested account names that
+  are generic words (info, data, temp, backup, ...) are not added to the
+  redaction literals, and literals are replaced as whole words only.
+- Anthropic provider: an SDK too old for server-side fallbacks degrades to a
+  plain request instead of crashing with a `TypeError`; one too old for
+  `output_config` reports a clear `ProviderError`.
+- `.env.example` no longer lists `AIIT_KEY_PASSPHRASE_FILE`; nothing reads it
+  yet (planned for the next release with the Windows key-protection work).
 - Agent `push --outbox` pushes every bundle and reports each failure instead
   of stopping at the first one; it exits 3 at the end if any failed.
 - An interrupted enforce run is refused on the next `apply` unless `--resume`

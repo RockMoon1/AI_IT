@@ -171,9 +171,8 @@ class PlainServerTests(ServerBase):
         srv = make_server(self.state, "127.0.0.1", 0, TOKEN, max_concurrent=1)
         port = srv.server_address[1]
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        hog = socket.create_connection(("127.0.0.1", port))
+        hog = socket.create_connection(("127.0.0.1", port))  # holds the only slot; it never sends a request line
         try:
-            hog.sendall(b"POST /v1/bundles HTTP/1.1\r\nHost: x\r\n")  # holds the only slot; its headers never finish
             time.sleep(0.3)
             req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/health", headers={"Authorization": f"Bearer {TOKEN}"})
             t0 = time.time()

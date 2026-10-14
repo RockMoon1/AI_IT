@@ -6,11 +6,13 @@ are recorded in the manifest, never fatal. Nothing here changes the system.
 from __future__ import annotations
 
 import json
+import ntpath
+import os
 import platform
 import shutil
 import string
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -44,6 +46,55 @@ def windows_system32_argv(exe: str, *args: str) -> list[str]:
     media. Resolving to System32 removes that search.
     """
     return [windows_system32(exe), *args]
+
+
+_PS_NAMES = ("powershell", "powershell.exe")
+_PS_FLAGS = ("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass")
+_PS_SCRIPT_SWITCHES = ("-command", "-c", "-file", "-f", "-encodedcommand", "-e", "-ec")
+
+
+def resolve_windows_argv(argv: list[str], exists=os.path.exists) -> list[str]:
+    """Return ``argv`` with a bare Windows program name made absolute.
+
+    A bare ``powershell``/``powershell.exe`` becomes the absolute Windows
+    PowerShell under System32 with the same switches ``_ps`` uses
+    (``-NoProfile -NonInteractive -ExecutionPolicy Bypass``, deduplicated,
+    ahead of the caller's ``-Command``/``-File``): on Windows a PowerShell
+    started without those switches has been seen to take 20 s or more to exit
+    on otherwise idle hosts, while the ``_ps`` form returns in well under a
+    second. Any other bare name that exists under System32 is started from
+    there. Names that carry a directory component are left alone, as are
+    bare names with no System32 counterpart (``run_one`` still looks those up
+    on PATH).
+    """
+    if not argv:
+        return argv
+    prog = argv[0]
+    if ntpath.basename(prog) != prog or not prog:
+        return argv
+    if prog.lower() in _PS_NAMES:
+        rest = list(argv[1:])
+        kept: list[str] = []
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            low = tok.lower()
+            if low in _PS_SCRIPT_SWITCHES:
+                kept.extend(rest[i:])
+                break
+            if low == "-executionpolicy":
+                i += 2  # drop the switch and its value; Bypass is re-added
+                continue
+            if low in ("-noprofile", "-noninteractive"):
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        return [powershell_exe(), *_PS_FLAGS, *kept]
+    candidate = windows_system32(prog if ntpath.splitext(prog)[1] else prog + ".exe")
+    if exists(candidate):
+        return [candidate, *argv[1:]]
+    return argv
 
 
 WINDOWS: list[Collector] = [
@@ -163,10 +214,11 @@ def run_one(c: Collector, out_root: Path) -> FileEntry:
     exit_code: int | None = None
     error: str | None = None
     output = b""
+    argv = resolve_windows_argv(c.argv) if os.name == "nt" else c.argv
     try:
-        if shutil.which(c.argv[0]) is None and not Path(c.argv[0]).exists():
-            raise FileNotFoundError(c.argv[0])
-        pr = run_capped(c.argv, c.timeout, cap=MAX_OUTPUT_BYTES)
+        if shutil.which(argv[0]) is None and not Path(argv[0]).exists():
+            raise FileNotFoundError(argv[0])
+        pr = run_capped(argv, c.timeout, cap=MAX_OUTPUT_BYTES)
         if pr.timed_out:
             error = f"timeout after {c.timeout}s"
             output = pr.stdout.encode("utf-8", "replace") + b"\n[timeout]\n"
@@ -176,13 +228,13 @@ def run_one(c: Collector, out_root: Path) -> FileEntry:
             if pr.stderr:
                 output += b"\n--- stderr ---\n" + pr.stderr.encode("utf-8", "replace")
     except FileNotFoundError:
-        error = f"command not found: {c.argv[0]}"
+        error = f"command not found: {argv[0]}"
     except Exception as e:  # pragma: no cover - defensive
         error = f"{type(e).__name__}: {e}"
     size = _write_capped(path, output if output else (error or "").encode("utf-8"))
     return FileEntry(
         path=rel, sha256=sha256_file(path), size=size, collector=c.name,
-        command=" ".join(c.argv)[:300], exit_code=exit_code,
+        command=" ".join(argv)[:300], exit_code=exit_code,
         duration_ms=int((time.time() - started) * 1000), error=error,
     )
 
@@ -215,7 +267,7 @@ def _native_disk_usage(out_root: Path, os_name: str) -> FileEntry:
                     if len(parts) > 2 and parts[2] in ("ext4", "xfs", "btrfs", "apfs", "hfs", "ntfs", "vfat", "exfat", "zfs"):
                         targets.append(parts[1])
         except Exception:
-            pass
+            pass  # no /proc/mounts (macOS) or unreadable: "/" alone is reported
     out = {}
     for t in dict.fromkeys(targets):
         try:

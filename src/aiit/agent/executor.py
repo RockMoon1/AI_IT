@@ -10,7 +10,7 @@ from ..common.crypto import verify_object
 from ..common.policy import Policy
 from ..common.schema import Enrollment, ExecutionReport, PlanStep, SignedPlan, StepResult
 from ..common.util import current_os, hostname, iso, parse_iso, read_json, utcnow
-from .procs import OUTPUT_CAP, powershell_exe, run_capped
+from .procs import OUTPUT_CAP, console_codec, powershell_exe, run_capped
 
 __all__ = [
     "OUTPUT_CAP", "load_signed_plan", "verify_signed_plan", "shell_argv",
@@ -78,11 +78,29 @@ def shell_argv(command: str, os_name: str) -> list[str]:
 
 
 def run_step(step: PlanStep, os_name: str) -> StepResult:
-    """Execute one command step through ``run_capped`` and build a StepResult."""
+    """Execute one command step through ``run_capped`` and build a StepResult.
+
+    On Windows the command is fed to PowerShell on stdin, encoded with the
+    console code page (``console_codec``), which is what ``powershell.exe``
+    decodes it with. A command containing a character that code page cannot
+    represent would run altered, so it is refused up front with status
+    ``failed`` and never started.
+    """
     started = iso()
     command = step.command or ""
     argv = shell_argv(command, os_name)
-    stdin_bytes = (command.encode("utf-8") + b"\n") if os_name == "windows" else None
+    stdin_bytes: bytes | None = None
+    if os_name == "windows":
+        codec = console_codec()
+        try:
+            stdin_bytes = command.encode(codec, "strict") + b"\n"
+        except UnicodeEncodeError as e:
+            return StepResult(
+                step_id=step.id, title=step.title, command=step.command, status="failed",
+                reason=(f"command contains characters the Windows console code page {codec} "
+                        f"cannot represent (position {e.start}); step not run"),
+                started_at=started, ended_at=iso(),
+            )
     try:
         pr = run_capped(argv, step.timeout_seconds, stdin_bytes=stdin_bytes, cap=OUTPUT_CAP)
     except Exception as e:  # pragma: no cover - defensive (e.g. shell missing)

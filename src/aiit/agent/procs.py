@@ -20,6 +20,7 @@ tools read stdin and write a redirected stdout in the OEM code page.
 from __future__ import annotations
 
 import codecs
+import contextlib
 import ntpath
 import os
 import signal
@@ -193,31 +194,29 @@ def _read_capped(handle, cap: int, encoding: str = "utf-8") -> str:
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """Terminate a timed out child and every process it spawned."""
+    """Terminate a timed out child and every process it spawned.
+
+    Every failure here is ignored on purpose: the child may already be gone,
+    and the caller still waits for it and reports the timeout either way.
+    """
     if os.name == "nt":
         taskkill = windows_system32("taskkill.exe")
-        try:
+        with contextlib.suppress(Exception):
             subprocess.run(
                 [taskkill, "/T", "/F", "/PID", str(proc.pid)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL, timeout=10, check=False,
             )
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             proc.kill()
-        except Exception:
-            pass
     else:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except ProcessLookupError:
-            pass
+            pass  # the group is already gone
         except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                proc.kill()  # fall back to the child alone
 
 
 def run_capped(argv, timeout, stdin_bytes: bytes | None = None,
@@ -263,17 +262,13 @@ def run_capped(argv, timeout, stdin_bytes: bytes | None = None,
     except subprocess.TimeoutExpired:
         timed_out = True
         _kill_tree(proc)
-        try:
-            proc.wait(timeout=10)
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=10)  # a stuck zombie is reported as timed out anyway
     finally:
         # Make sure the stdin pipe is closed even on an unusual error path.
         if proc.stdin is not None:
-            try:
+            with contextlib.suppress(Exception):
                 proc.stdin.close()
-            except Exception:
-                pass
     exit_code = proc.returncode
     stdout = _read_capped(out_f, cap, codec)
     stderr = _read_capped(err_f, cap, codec)

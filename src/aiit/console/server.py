@@ -177,6 +177,18 @@ class MailboxServer(ThreadingHTTPServer):
     allow_reuse_address = True
     request_queue_size = 64
 
+    # A peer that disappears mid-request is routine on a LAN (laptop lid closed,
+    # Wi-Fi roam); it gets one log line, not a traceback.
+    _QUIET_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout)
+
+    def handle_error(self, request: Any, client_address: Any) -> None:  # type: ignore[override]
+        exc = sys.exc_info()[1]
+        if isinstance(exc, self._QUIET_ERRORS) or isinstance(exc, ssl.SSLError):
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+            print(f"[serve {ts}] {client_address[0]} connection dropped: {type(exc).__name__}", file=sys.stderr)
+            return
+        super().handle_error(request, client_address)
+
     def __init__(self, addr: tuple[str, int], handler: type, max_concurrent: int = 32, tls_context: ssl.SSLContext | None = None):
         super().__init__(addr, handler)
         self.slots = threading.BoundedSemaphore(max_concurrent)

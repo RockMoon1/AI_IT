@@ -250,7 +250,8 @@ def cmd_audit(args: argparse.Namespace) -> None:
         for e in st.audit.timeline(args.case):
             print(f"{e['ts']}  {e.get('label', e['action']):22} {json.dumps(e.get('details', {}))[:140]}")
     elif sub == "repair-tail":
-        print(json.dumps(st.audit.repair_tail(), indent=2))
+        # re-sign the checkpoint right away when the console has an identity (mirrors the agent CLI)
+        print(json.dumps(st.audit.repair_tail(identity=st.identity() if st.is_initialized() else None), indent=2))
 
 
 def cmd_serve(args: argparse.Namespace) -> None:

@@ -137,7 +137,7 @@ class BasicCommandTests(ConsoleCliBase):
         code, out = self.console_exit("approve", case_id, plan_id, "--yes")
         self.assertIn("lifetime 100 h exceeds 72", out)
         self.assertIn("Signed plan written", self.console("approve", case_id, plan_id, "--yes", "--long-lived"))
-        self.assertEqual(parse_iso(self.signed_plan(case_id, plan_id)["expires_at"]), now + timedelta(hours=100))
+        self.assertEqual(parse_iso(self.signed_plan(case_id, plan_id)["expires_at"]), (now + timedelta(hours=100)).replace(microsecond=0))
 
     def test_ack_warnings_is_a_hard_gate(self):
         case_id = self.ingest()
@@ -247,7 +247,18 @@ class BasicCommandTests(ConsoleCliBase):
             self.assertIn("wrote", self.console("audit", "export", "--format", fmt, "--out", str(out_path), "--case", case_id))
             self.assertTrue(out_path.exists())
         self.assertIn("ingest", self.console("audit", "timeline", case_id))
-        self.console("audit", "repair-tail")
+        def result_json(text):  # the JSON result; stderr (the start-up chain banner) is captured after it
+            return json.loads(text[text.index("{"):text.rindex("}") + 1])
+
+        self.assertFalse(result_json(self.console("audit", "repair-tail"))["repaired"])
+        # a torn trailing write (power loss mid-append) is repaired and the signed checkpoint is refreshed
+        with open(self.state.audit.path, "ab") as f:
+            f.write(b'{"seq": 999, "action": "torn')
+        res = result_json(self.console("audit", "repair-tail"))
+        self.assertTrue(res["repaired"])
+        self.assertFalse(res["checkpoint_offset_stale"])
+        self.assertTrue(self.state.audit.corrupt_path.exists())
+        self.assertTrue(self.console("audit").startswith("OK: "))
 
     def test_serve_refuses_non_loopback_without_tls(self):
         code, out = self.console_exit("serve", "--host", "10.1.2.3", "--port", "0", "--token", "unit-test-token-0123456789abcdef")

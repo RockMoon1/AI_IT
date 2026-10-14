@@ -1,7 +1,6 @@
 """Docs and examples must not drift from the code."""
 import re
 import unittest
-from pathlib import Path
 
 from . import helpers
 from aiit.agent.cli import build_parser as agent_parser
