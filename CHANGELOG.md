@@ -1,0 +1,254 @@
+# Changelog
+
+All notable changes to AI_IT are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the major
+version is 0, a minor release may contain breaking changes; each one is marked
+**BREAKING** with the step an operator has to take.
+
+## [Unreleased]
+
+PR 1, "Harden the core": closes every confirmed security hole, makes the
+network and audit paths resilient, measures coverage on three operating
+systems and four Python versions, and adds governance and threat-model
+documentation. No new runtime dependencies, no change to the sealed bundle or
+signed plan wire formats; existing bundles and plans remain readable.
+
+### Security
+
+- Policy engine: fixed deny-list bypasses (`powershell -enc`, mixed-case
+  cmdlets, PowerShell aliases and backticks, `sudo`/`env`/`exec` prefixes,
+  quoted paths, `curl ... | sudo bash`, `rm -r -f /`, `Remove-Item -Recurse
+  C:\ -Force`). Commands are now matched against an OS-aware normalised form as
+  well as the raw text, and a set of structural denies catches whole families
+  (encoded commands, `Invoke-Expression`, `FromBase64String`, downloads to
+  memory, pipes into any interpreter, command substitution, nested shells,
+  `osascript`, inline `python -c`/`perl -e`/`node -e`, recursive deletes of a
+  system root).
+- Policy engine: the allow-list uses `re.fullmatch` instead of `re.search`, so
+  an allowed prefix can no longer be chained with `;`, `&&` or `|`. Shell
+  control characters are refused unless the matching allow entry contains them.
+- Policy engine: a locally computed risk floor (`effective_risk = max(declared,
+  floor)`) so a mislabelled "read_only" step that runs a mutating verb cannot
+  slip under `max_risk`. Sites can tighten it with `risk_floor_overrides`.
+- Policy engine: many new deny families (Defender, firewall, BitLocker and
+  event-log tampering, persistence keys, `find / -delete`, `iptables -F`,
+  `nft flush`, sudoers, `passwd -d`, `diskutil secureErase`, `tmutil delete`,
+  `sysadminctl -addUser`, `dscl . -create`, `socketfilterfw` off, `spctl
+  --global-disable`, `nvram boot-args`); `poweroff`, `halt` and
+  `Stop-Computer` now hit the reboot gate.
+- Console ingest: path traversal through header and manifest ids and through
+  manifest file paths is closed. Ids are validated against a strict pattern,
+  member paths must be relative with no `..`, drive or backslash, every file
+  write goes through `safe_join`, and the archive is unpacked into a temporary
+  directory that is only renamed into place after the manifest, agent
+  identity and every hash have been checked.
+- Console report ingest: agent ownership and key pinning are checked before
+  anything is unpacked, and a report that names another case inside the
+  archive is refused.
+- Bundle extraction limits: at most 2000 members, 8 MiB per member and
+  256 MiB uncompressed; only regular files and directories are extracted;
+  symlinks, devices, absolute paths and drive letters are rejected before
+  anything is written.
+- Subprocess environment is scrubbed for plan steps and collectors: only a
+  short allow-list of variables is inherited, anything named like
+  `AIIT_*`, `*_TOKEN`, `*_KEY`, `*_SECRET` or containing `PASS` is dropped,
+  `PATH` is fixed to system directories and the current directory is removed
+  from executable search. The key passphrase and the LAN token no longer
+  reach command output.
+- Windows: `powershell.exe` and every Windows collector binary are started by
+  absolute `System32` path so a planted executable next to a plan on removable
+  media is never picked up. Plan steps are fed to PowerShell on stdin as the
+  exact bytes the policy evaluated (no `-EncodedCommand`, no `.ps1`).
+- Planner: the operator's `--issue` text is redacted through the case's
+  redactor before it reaches a model; previously it was sent verbatim.
+  Collected files are wrapped in data fences with a per-request random
+  delimiter and the system prompt declares fenced content to be data, not
+  instructions.
+- Redaction: closed gaps for key/value secrets with underscores and
+  `passphrase`, URL userinfo, `Authorization: Basic`, JWTs, `--password`
+  flags, IPv6, JSON-escaped Windows user paths, `DOMAIN\user`, SIDs, UNC
+  server names and labelled serial numbers, UUIDs, machine ids and registered
+  owners; hostnames match on word boundaries. Usernames found in
+  `local_users`, `computerinfo` and osquery `logged_in_users` are added as
+  redaction literals automatically. Per-case redaction settings are persisted
+  so reports and operator text are redacted with the same configuration.
+- Network: one retrying HTTP helper (`aiit.common.net.http_json`) with bounded
+  retries, jittered backoff, `Retry-After`, response size cap and a single
+  error type, so a timeout or a proxy HTML page is an error message instead
+  of a traceback.
+- Audit log: tolerant of torn lines (a crash mid-append is reported as a
+  break, never a traceback), appends under a cross-process file lock with
+  `fsync`, signed checkpoints (`audit.jsonl.head.json`) that detect truncation
+  below the last checkpoint, a console-side witness of each agent's audit head
+  that records `audit_regression`, a chain check at the start of every command
+  and on a timer while `serve` runs, and alert sinks (`AIIT_ALERT_CMD`,
+  `AIIT_ALERT_SYSLOG`, `AIIT_ALERT_WEBHOOK`). CSV export guards against
+  spreadsheet formula injection; HTML export escapes every value.
+- Console ingest is idempotent on `bundle_id` (`bundles_index.json`), so a
+  retried LAN upload cannot create a duplicate case.
+- LAN server: 30 s socket timeout, guarded `Content-Length`, bodies streamed
+  to a temp file with a 64 MiB cap, bounded concurrency, TLS 1.2 minimum with
+  a handshake timeout, per-IP back-off after repeated authentication failures,
+  constant-time token comparison, and server version taken from the package.
+- `aiit-agent pull` validates and verifies every plan (schema, signature,
+  target, expiry, lifetime) before saving it to the inbox.
+- Signed plans: agents refuse a plan whose `created_at` is more than five
+  minutes in the future or whose lifetime exceeds `max_plan_hours`.
+- Agent `apply` evaluates every step against the policy before running any
+  (preflight), keeps a write-ahead marker for `--resume`, and requires a typed
+  `APPLY` in enforce mode and a typed `REPLAY` for `--force-replay`.
+- Private files are written atomically (temp file, `fsync`, rename) with
+  `0600` and `O_NOFOLLOW` where the platform supports it.
+- Secret scanning: the synthetic fixtures in `tests/test_redact.py` and
+  `tests/fixtures/redaction/` are built by concatenation and allow-listed by
+  path in `.gitleaks.toml`, so the CI secret scan is green again.
+
+### Added
+
+- `aiit-agent push <file|--outbox>` to upload bundles or reports that were
+  kept locally after a failed push; `AIIT_SERVER_TOKEN_FILE` as an
+  alternative to the environment variable; on push failure the bundle is kept
+  and the command exits 3.
+- `aiit-console audit` and `aiit-agent audit` subcommand groups:
+  `verify`, `export --format csv|jsonl|html`, `timeline`, `repair-tail`.
+- Console settings: `--env-file` and `AIIT_ENV_FILE`.
+- `Policy.digest()`, printed by `aiit-agent policy digest`, `enroll` and
+  `apply`, for pinning a fleet policy.
+- Planner repair loop: when the model returns unparseable or schema-invalid
+  output the console feeds the validation errors back up to
+  `AIIT_PLAN_REPAIRS` times (default 1), audits every attempt, and saves the
+  rejected output privately on final failure. Refusals are never retried.
+- Ollama provider: `AIIT_OLLAMA_TIMEOUT`, `AIIT_OLLAMA_NUM_CTX`, a "run
+  `ollama pull`" hint on 404, and a fallback to `format: json` when the server
+  rejects a schema.
+- Anthropic provider: `AIIT_HIPAA_MODE=1` disables beta features (server-side
+  refusal fallbacks) so requests stay on the BAA-covered surface; a beta 400
+  degrades once to the plain Messages call; `AIIT_LLM_MAX_RETRIES` and
+  `AIIT_LLM_TIMEOUT`.
+- `audit_head` in bundle manifests and execution reports (the agent's last
+  audit entry), consumed by the console witness.
+- Shared primitives in `aiit.common.util`: `validate_id`, `safe_join`,
+  `file_lock`, `atomic_write_bytes`.
+- Process helper `aiit.agent.procs.run_capped` with output spooled to temp
+  files, a hard output cap and process-group (POSIX) or process-tree
+  (Windows) kill on timeout.
+- CI: Python 3.13 and 3.14 in the matrix (3.10, 3.12, 3.13, 3.14 on Linux,
+  Windows and macOS), coverage collection with a combined gate, `bandit`,
+  `pip-audit` on a runtime-only install, an install-from-wheel job with an
+  offline wheelhouse simulation, cancel-in-progress concurrency.
+- CodeQL workflow (push, pull request and weekly), Dependabot for GitHub
+  Actions and pip.
+- Governance files: `CODE_OF_CONDUCT.md`, `GOVERNANCE.md`, `SUPPORT.md`,
+  `.github/CODEOWNERS`, issue templates (bug, feature, provider request),
+  pull request template.
+- `docs/security/threat-model.md` (STRIDE table with control, location, test
+  and residual risk for every threat, attack trees, crypto inventory,
+  accepted risks, assessment scope) and
+  `docs/compliance/risk-analysis-template.md`.
+- `scripts/run-tests.ps1` for Windows and `scripts/run-tests.sh --coverage`.
+- Tests: `test_util`, `test_net`, `test_store`, `test_server`,
+  `test_agent_cli`, `test_console_cli`, `test_audit`, `test_docs`, a
+  table-driven policy bypass corpus, golden redaction fixtures, and a
+  scripted `FakeHTTP` server in `tests/helpers.py`.
+
+### Changed
+
+- **BREAKING**: the console reads `.env` from its data directory
+  (`<data dir>/.env`, default `~/.aiit/console/.env`) or from
+  `--env-file` / `AIIT_ENV_FILE`, never from the current directory. A `.env`
+  in the working directory is ignored with a note. Move your file:
+  `cp .env ~/.aiit/console/.env` (or point `AIIT_ENV_FILE` at it). A group- or
+  world-writable file is refused on POSIX.
+- **BREAKING**: `aiit-console serve` refuses to bind to anything but loopback
+  without `--tls-cert`/`--tls-key` unless `--insecure-no-tls` is passed
+  explicitly. The default `--host 0.0.0.0` therefore needs TLS.
+- **BREAKING**: the LAN server returns `422` when a bundle is rejected
+  (bad signature, bad manifest, path escape) and `503` for storage errors;
+  previously both were `400`. Clients that branch on the status code must be
+  updated. `429` with `Retry-After` is returned after repeated
+  authentication failures from one address.
+- **BREAKING**: `audit` is a subcommand group on both CLIs
+  (`audit verify|export|timeline|repair-tail`). `aiit-console audit-verify`
+  is kept as an alias for `audit verify`.
+- **BREAKING**: plan ids, agent ids, bundle ids, case ids and console ids are
+  validated against `^[a-z]{1,16}-[0-9a-f]{12}$` everywhere they are read from
+  a file, a header or the network. Ids minted by any released version match;
+  hand-edited ids do not.
+- **BREAKING**: agents refuse plans whose lifetime (`expires_at - created_at`)
+  exceeds `max_plan_hours` (default 72) in `policy.json`.
+  `aiit-console approve --hours` above 72 needs `--long-lived` and a raised
+  `max_plan_hours` on the endpoint.
+- `policy.json` version `2`: new fields `max_plan_hours` and
+  `risk_floor_overrides`; version 1 files load with defaults. Every pattern is
+  compiled on load and a bad regex is reported by name.
+- `LLMProvider.complete_json(system, user, schema, meta)` takes a fourth
+  `meta` argument (local-only hints: target OS, case id, redacted issue
+  text) and providers raise `ProviderOutputError` carrying the raw text when
+  the answer is not usable JSON; `parse_json_text` is shared by all
+  providers.
+- Every `llm_request` audit entry records `hosted` and `endpoint` so an
+  auditor can see whether data left the operator machine.
+- Ingest records `ingest_failed` and `ingest_duplicate`; the server records
+  `serve_auth_fail` and `serve_ingest_error`.
+- Agent exit codes: 2 usage, 3 network, 4 verification, 5 policy.
+- `tests/test_e2e.py` runs the LAN loop through the hardened server.
+
+### Fixed
+
+- Read timeouts in the Ollama and Anthropic providers surfaced as a bare
+  `TimeoutError` traceback instead of a `ProviderError` with a hint.
+- A torn last line in `audit.jsonl` (power loss mid-append) made every later
+  command crash; it is now reported as a break and `audit repair-tail` moves
+  the fragment aside.
+- `aiit-console report` accepted a report whose archive paths escaped the case
+  directory.
+- Docs drift: `docs/architecture.md` described a `require_reboot_flag` policy
+  field, an old `complete_json` signature and three LAN endpoints;
+  `docs/compliance/hipaa.md` linked a risk-analysis template that did not
+  exist; `docs/research/open-source-landscape.md` promised an automatic
+  dry-run fallback that was never implemented.
+
+### Planned (lands in PR 2, listed here because it changes defaults)
+
+- **BREAKING**: hosted providers (today `anthropic`, plus the planned
+  OpenAI-compatible provider pointed at a non-private host) will require
+  `AIIT_ALLOW_HOSTED=1` or `--allow-hosted`. This is the HIPAA-safe default:
+  nothing leaves the operator machine unless an operator says so. Set the
+  variable in the console `.env` before upgrading if you use `anthropic`.
+- An explicit `--fallback dryrun` option for `diagnose` (never automatic,
+  only towards a more private provider, always audited).
+- Windows ACLs (`icacls`) on the agent and console state directories, a
+  passphrase prompt and `AIIT_KEY_PASSPHRASE_FILE`, key fingerprint
+  confirmation at enrollment.
+
+## [0.1.0] - 2026-10-08
+
+Initial release: the whole offline loop working end to end.
+
+### Added
+
+- `aiit-agent` for endpoints: `enroll`, `collect` (Windows, Linux and macOS
+  collectors, osquery when present), `apply` (signature, target, expiry and
+  replay checks, local policy with deny patterns, risk ceiling and dry-run
+  default), `pull`, `status`, `policy`, `audit-verify`.
+- `aiit-console` for the operator machine: `init`, `enrollment`, `ingest`
+  (decrypt, verify, redact into a case folder), `cases`, `show`, `preview`,
+  `diagnose` (dryrun, Ollama and Anthropic providers with structured output),
+  `plans`, `plan`, `approve` (Ed25519-signed plans bound to agent, case and
+  expiry), `report`, `agents`, `audit-verify`, `serve` (LAN mailbox with a
+  shared token and optional TLS).
+- Sealed bundle format `.aiit`: X25519 + HKDF-SHA256 + AES-256-GCM to the
+  console key, Ed25519 agent signature over the header, SHA-256 per file in
+  the manifest.
+- Deterministic per-case redaction (HMAC-SHA256 tokens) for emails, SSNs,
+  phones, cards, IPs, MACs, user paths, hostnames and obvious secrets.
+- Hash-chained JSONL audit log on both sides.
+- CI on Linux, Windows and macOS with gitleaks secret scanning; pre-commit
+  hooks; Apache-2.0 license.
+- Research and design documents: `docs/architecture.md`,
+  `docs/compliance/hipaa.md`, `docs/research/open-source-landscape.md`,
+  `docs/roadmap.md`.
+
+[Unreleased]: https://github.com/RockMoon1/AI_IT/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/RockMoon1/AI_IT/releases/tag/v0.1.0

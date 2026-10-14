@@ -1,0 +1,94 @@
+name: Provider request
+description: Ask for support for another model server or hosted model API.
+title: "[provider]: "
+labels: ["provider", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        AI_IT ships `dryrun`, `ollama` and `anthropic` providers, and an OpenAI-compatible provider is planned (see `docs/roadmap.md`). Many model servers already speak the OpenAI or Ollama API shape, so the answer may be "set the base URL". This form collects what we need to decide. Never paste an API key.
+
+  - type: input
+    id: server
+    attributes:
+      label: Model server or service
+      description: Name and version, with a link to its documentation.
+      placeholder: vLLM 0.6, LM Studio 0.3, Azure OpenAI, Vertex AI
+    validations:
+      required: true
+
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does it run
+      description: This decides whether the provider is treated as hosted (data leaves the operator machine) and gated behind the hosted-provider opt-in.
+      options:
+        - On the operator machine (loopback)
+        - On the same LAN, self-hosted
+        - Hosted by a third party
+    validations:
+      required: true
+
+  - type: dropdown
+    id: api_shape
+    attributes:
+      label: API shape
+      options:
+        - OpenAI chat completions compatible
+        - Ollama /api/chat compatible
+        - Anthropic Messages compatible
+        - Vendor-specific (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: api_details
+    attributes:
+      label: API details
+      description: Base URL pattern, authentication header, any required extra headers or deployment names. Use placeholders for keys and account ids.
+      render: text
+
+  - type: dropdown
+    id: structured
+    attributes:
+      label: Structured output support
+      description: AI_IT asks the model for a JSON plan validated against a schema. How does this server constrain output?
+      options:
+        - JSON schema enforced server-side (response_format json_schema or equivalent)
+        - JSON mode only (valid JSON, no schema)
+        - Tool/function calling only
+        - None; free text that must be parsed
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hipaa
+    attributes:
+      label: HIPAA / BAA status
+      description: Relevant only for hosted services. See `docs/compliance/hipaa.md`, section 5.
+      options:
+        - Not applicable (self-hosted, no third party)
+        - Vendor offers a BAA for this service
+        - Vendor does not offer a BAA
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this provider
+      description: What it offers over the local Ollama default or the planned OpenAI-compatible provider (model quality, hardware, existing contract, air-gapped availability).
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: can_test
+    attributes:
+      label: Testing
+      options:
+        - label: I can test a branch against this server and report back
+          required: false
+        - label: I did not paste an API key, account id or any customer data
+          required: true

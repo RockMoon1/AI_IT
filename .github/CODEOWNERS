@@ -1,0 +1,19 @@
+# Code owners are requested for review automatically on every pull request
+# that touches a matching path. Later rules override earlier ones.
+# The project is single-maintainer today (see GOVERNANCE.md); the explicit
+# lines below mark the trust-boundary files so that a future second maintainer
+# can be added to the default rule without widening ownership of these.
+
+*                                   @RockMoon1
+
+# Trust boundaries: changes here need a threat-model update and a failure-case test.
+src/aiit/common/crypto.py           @RockMoon1
+src/aiit/common/policy.py           @RockMoon1
+src/aiit/common/redact.py           @RockMoon1
+src/aiit/common/audit.py            @RockMoon1
+src/aiit/agent/executor.py          @RockMoon1
+src/aiit/agent/procs.py             @RockMoon1
+src/aiit/console/server.py          @RockMoon1
+
+# CI, templates, Dependabot and CodeQL configuration.
+.github/                            @RockMoon1

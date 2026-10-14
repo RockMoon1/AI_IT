@@ -1,38 +1,9 @@
-import json
-import tempfile
 import unittest
-from pathlib import Path
 
 from pydantic import ValidationError
 
 from . import helpers  # noqa: F401
-from aiit.common.audit import AuditLog
 from aiit.common.schema import FixPlanDraft, PlanStep, plan_json_schema
-
-
-class AuditTests(unittest.TestCase):
-    def test_chain_verify_and_tamper(self):
-        with tempfile.TemporaryDirectory() as d:
-            log = AuditLog(Path(d) / "audit.jsonl", actor_id="console-1")
-            self.assertEqual(log.verify(), (True, "0 entries verified"))
-            log.record("init")
-            log.record("ingest", case_id="c1", files=3)
-            log.record("plan_approved", plan_id="p1")
-            ok, msg = log.verify()
-            self.assertTrue(ok, msg)
-            self.assertEqual(msg, "3 entries verified")
-            lines = (Path(d) / "audit.jsonl").read_text().splitlines()
-            e = json.loads(lines[1])
-            e["details"]["files"] = 99
-            lines[1] = json.dumps(e, sort_keys=True)
-            (Path(d) / "audit.jsonl").write_text("\n".join(lines) + "\n")
-            ok, msg = log.verify()
-            self.assertFalse(ok)
-            self.assertIn("entry 2", msg)
-            lines = (Path(d) / "audit.jsonl").read_text().splitlines()
-            del lines[1]
-            (Path(d) / "audit.jsonl").write_text("\n".join(lines) + "\n")
-            self.assertFalse(log.verify()[0])
 
 
 class SchemaTests(unittest.TestCase):

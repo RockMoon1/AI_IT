@@ -1,0 +1,30 @@
+# Dependabot keeps the pinned GitHub Actions and the Python dependencies current.
+# Runtime dependencies are deliberately few (cryptography, pydantic); updates to
+# them still go through the full three-OS test matrix before merge.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "deps"
+    groups:
+      dev-tools:
+        patterns:
+          - "pre-commit"
+          - "coverage*"
+          - "bandit"
+          - "pip-audit"
