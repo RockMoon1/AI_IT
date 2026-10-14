@@ -73,7 +73,18 @@ signed plan wire formats; existing bundles and plans remain readable.
 - Windows: `powershell.exe` and every Windows collector binary are started by
   absolute `System32` path so a planted executable next to a plan on removable
   media is never picked up. Plan steps are fed to PowerShell on stdin as the
-  exact bytes the policy evaluated (no `-EncodedCommand`, no `.ps1`).
+  exact bytes the policy evaluated (no `-EncodedCommand`, no `.ps1`). The
+  child `PATH` is built from the real `SystemRoot` at call time (an earlier
+  draft passed a literal `%SystemRoot%` that CreateProcess never expands, so
+  no native tool could be found). A bare `powershell.exe` collector is
+  normalised to the absolute, non-interactive form; other bare names that
+  exist under System32 are started from there.
+- Windows: the command bytes sent to PowerShell and the output read back use
+  the console's OEM code page, so a non-ASCII path in a step is run as written
+  and output is not mojibake; a step the code page cannot represent is
+  refused with a clear reason instead of running altered. The child locale is
+  pinned per platform (`C.UTF-8` on Linux, `en_US.UTF-8` on macOS, `C`
+  elsewhere) so tools stop printing `setlocale` warnings into collected files.
 - Planner: the operator's `--issue` text is redacted through the case's
   redactor before it reaches a model; previously it was sent verbatim.
   Collected files are wrapped in data fences with a per-request random
