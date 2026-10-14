@@ -25,7 +25,8 @@ class DocDriftTests(unittest.TestCase):
         seen = 0
         for doc in DOC_FILES:
             for line in doc.read_text(encoding="utf-8").splitlines():
-                m = re.match(r"^\s*(?:\$\s*)?(aiit-(?:agent|console))\s+(?:--[\w-]+(?:\s+\S+)?\s+)*([a-z][\w-]*)", line)
+                # an option value never starts with "-", which keeps the option group unambiguous (no catastrophic backtracking)
+                m = re.match(r"^\s*(?:\$\s*)?(aiit-(?:agent|console))\s+(?:--[\w-]+(?:=\S+|\s+[^-\s]\S*)?\s+)*([a-z][\w-]*)", line)
                 if not m:
                     continue
                 tool, sub = m.group(1), m.group(2)
@@ -33,14 +34,19 @@ class DocDriftTests(unittest.TestCase):
                 self.assertIn(sub, known[tool], f"{doc.name}: `{line.strip()}` uses unknown subcommand {sub!r}")
         self.assertGreater(seen, 10)
 
-    def test_every_env_var_is_documented(self):
+    def test_env_vars_in_code_and_env_example_agree(self):
+        # Every AIIT_* string literal counts as a read, so indirect readers such as
+        # ollama._env_float("AIIT_OLLAMA_TIMEOUT", ...) are covered, not only os.environ.get("...").
         used = set()
         for py in (ROOT / "src").rglob("*.py"):
-            used.update(re.findall(r"environ(?:\.get)?\(\s*[\"'](AIIT_[A-Z0-9_]+)[\"']", py.read_text(encoding="utf-8")))
-            used.update(re.findall(r"environ\[\s*[\"'](AIIT_[A-Z0-9_]+)[\"']\s*\]", py.read_text(encoding="utf-8")))
+            used.update(re.findall(r"[\"'](AIIT_[A-Z0-9_]+)[\"']", py.read_text(encoding="utf-8")))
         documented = set(re.findall(r"^#?\s*(AIIT_[A-Z0-9_]+)\s*=", (ROOT / ".env.example").read_text(encoding="utf-8"), re.M))
+        self.assertIn("AIIT_OLLAMA_TIMEOUT", used)
+        self.assertGreater(len(used), 15)
         missing = sorted(used - documented - ENV_EXEMPT)
         self.assertEqual(missing, [], f"document these in .env.example: {missing}")
+        stale = sorted(documented - used - ENV_EXEMPT)
+        self.assertEqual(stale, [], f"documented in .env.example but nothing in src reads them: {stale}")
 
     def test_changelog_has_unreleased_section(self):
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")

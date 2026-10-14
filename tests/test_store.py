@@ -2,12 +2,14 @@
 import json
 import tempfile
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 from . import helpers
 from aiit.common.crypto import CryptoError, Identity
 from aiit.common.redact import RedactionConfig
 from aiit.common.util import read_json
+from aiit.console.store import _harvest_usernames
 
 
 def leftovers(state):
@@ -99,6 +101,26 @@ class IngestTests(unittest.TestCase):
         self.assertNotIn("Jane Doe", red)
         self.assertNotIn("jsmith", red)
 
+    def test_harvested_usernames_skip_generic_names_and_are_word_bounded(self):
+        with tempfile.TemporaryDirectory() as d:
+            raw = Path(d)
+            (raw / "sys").mkdir()
+            (raw / "sys" / "local_users.json").write_text(json.dumps(
+                [{"Name": "mark"}, {"Name": "info"}, {"Name": "Backup"}, {"Name": "jsmith"}, {"Name": "bob"}, {"Name": "1001"}]))
+            # real account names stay; generic words, short names and numbers are dropped
+            self.assertEqual(_harvest_usernames(raw), ["jsmith", "mark"])
+        users = json.dumps([{"Name": "mark"}, {"Name": "info"}])
+        log = "information about bookmarks: marker=on; user mark logged in; remark by Mark"
+        p = self.bundle(files={"sys/local_users.json": users, "sys/log.txt": log})
+        case_id, _, _ = self.state.ingest_bundle(p)
+        cfg = read_json(self.state.cases_dir / case_id / "redaction_config.json")
+        self.assertIn("mark", cfg["extra_literals"])
+        self.assertNotIn("info", cfg["extra_literals"])
+        red = (self.state.cases_dir / case_id / "redacted" / "sys" / "log.txt").read_text(encoding="utf-8")
+        # the account is tokened as a whole word only; unrelated words keep their letters
+        self.assertTrue(red.startswith("information about bookmarks: marker=on; user <NAME_"), red)
+        self.assertTrue(red.endswith("logged in; remark by Mark"), red)
+
 
 class ReportIngestTests(unittest.TestCase):
     def setUp(self):
@@ -136,8 +158,13 @@ class ReportIngestTests(unittest.TestCase):
     def test_wrong_agent_is_refused_before_unpacking(self):
         other = helpers.agent_identity("agent-000000000002")
         p = helpers.seal_report(self.state, other, self.root / "r.aiit", self.case_id, self.plan_id, self.ok)
-        with self.assertRaises(CryptoError) as cm:
-            self.state.ingest_bundle(p)
+        # Make the ordering observable: if the ownership check ever moved below the unpack, this
+        # AssertionError (which ingest_bundle does not catch) fails the test instead of the cleaned-up
+        # temp dir hiding the difference.
+        with mock.patch("aiit.console.store.unpack_to", side_effect=AssertionError("unpack_to must not run for a foreign report")) as up:
+            with self.assertRaises(CryptoError) as cm:
+                self.state.ingest_bundle(p)
+        up.assert_not_called()
         self.assertIn("different agent", str(cm.exception))
         self.assertEqual(self.reports_tmp(), [])
         self.assertFalse(any((self.state.cases_dir / self.case_id / "reports").glob("r-*")))

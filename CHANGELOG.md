@@ -172,6 +172,20 @@ signed plan wire formats; existing bundles and plans remain readable.
   scripted `FakeHTTP` server in `tests/helpers.py`.
 
 ### Changed
+- Agent `push --outbox` pushes every bundle and reports each failure instead
+  of stopping at the first one; it exits 3 at the end if any failed.
+- An interrupted enforce run is refused on the next `apply` unless `--resume`
+  (continue after the completed steps) or `--force-replay` (typed REPLAY,
+  audited) is given; previously a note was printed and every step ran again.
+- HTTP helper: `Retry-After` is honoured as sent up to 120 s; above that the
+  request fails at once instead of hammering the server. Requests to loopback
+  and private addresses bypass `http_proxy`/`https_proxy`, so a corporate
+  proxy setting no longer breaks the LAN mailbox or a local Ollama.
+- Audit: `check_and_alert` runs a full chain scan while the log is at most
+  8 MiB and only switches to the incremental scan above that, so a same-length
+  edit before the last checkpoint is caught at start-up. `audit repair-tail`
+  re-signs the checkpoint when the identity is available; a stale checkpoint
+  offset falls back to the full scan instead of alarming forever.
 - Collectors run under the same scrubbed environment as plan steps, so the `env_names` collector now lists only that reduced set (no `AIIT_*`, token, key or passphrase variables reach a bundle).
 
 - **BREAKING**: the console reads `.env` from its data directory

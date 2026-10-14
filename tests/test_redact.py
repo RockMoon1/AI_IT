@@ -538,5 +538,19 @@ class GoldenFixtureTests(unittest.TestCase):
                 self.assertEqual(a, b)
 
 
+class ExtraLiteralTests(unittest.TestCase):
+    def test_extra_literals_are_word_bounded_and_exact_case(self):
+        # An auto-harvested account "mark" or an operator literal "Dell" must token the name itself
+        # without corrupting "bookmarks", "marker" or "remark" (the probe from the review finding).
+        r = Redactor(KEY, RedactionConfig(extra_literals=["mark", "Dell"]))
+        out = r.redact("bookmarks: 3; marker=on; user mark logged in; Dell Inc.; remark by Mark; mark-2 mark_x")
+        self.assertTrue(out.startswith("bookmarks: 3; marker=on; user <NAME_"), out)
+        self.assertTrue(out.endswith(" Inc.; remark by Mark; mark-2 mark_x"), out)
+        self.assertNotIn("user mark ", out)
+        self.assertNotIn("Dell Inc", out)
+        self.assertEqual(out.count("<NAME_"), 2)
+        self.assertEqual(r.map[r.token("NAME", "mark")], "mark")
+
+
 if __name__ == "__main__":
     unittest.main()

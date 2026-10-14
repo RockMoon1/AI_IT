@@ -281,11 +281,14 @@ class AuditTests(unittest.TestCase):
                 self.assertIsNone(log2.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=out))
                 self.assertEqual(out.getvalue(), "")
                 self.assertFalse(log2.verify(expected_pub=ident.sign_pub_hex)[0])
-                # but a truncation below the checkpoint or an edit after it is still caught in that mode
+                # but a truncation below the checkpoint is still caught in that mode: the offset no longer
+                # fits the file, so the full scan runs and reports everything, the earlier edit first
                 lines = log2.path.read_bytes().split(b"\n")
                 log2.path.write_bytes(b"\n".join(lines[:3]) + b"\n")
+                reasons = [x.reason for x in log2.verify_detailed(expected_pub=ident.sign_pub_hex)]
+                self.assertTrue(any("shorter than checkpoint" in r for r in reasons), reasons)
                 b = log2.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=io.StringIO())
-                self.assertIn("shorter than checkpoint", b.reason)
+                self.assertEqual((b.line_no, b.seq), (2, 2))
 
     def test_repair_tail_splice_keeps_the_checkpoint_verifiable(self):
         """Power loss mid-append, start-up check, a state change (checkpoint), then repair-tail: no endless alarm."""

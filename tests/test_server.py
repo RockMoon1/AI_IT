@@ -7,10 +7,10 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock as mock
 import urllib.error
 import urllib.request
 from pathlib import Path
-from unittest import mock
 
 from . import helpers
 from aiit.console import server as server_mod
@@ -135,6 +135,66 @@ class PlainServerTests(ServerBase):
         self.assertEqual(status, 200)
         self.assertLess(time.time() - t0, 5)
         slow.close()
+
+    def test_storage_errors_map_to_503(self):
+        p = helpers.seal_diagnostics(self.state, self.agent, self.root / "d.aiit")
+        with mock.patch.object(type(self.state), "ingest_bundle", side_effect=OSError(28, "No space left on device")):
+            status, body, _ = self.request("POST", "/v1/bundles", p.read_bytes())
+        self.assertEqual(status, 503)  # retryable for the agent, unlike 500
+        self.assertIn("storage", body["error"])
+        self.assertNotIn("No space left", json.dumps(body))  # the OS detail goes to the audit log, not the wire
+        last = self.state.audit.entries()[-1]
+        self.assertEqual(last["action"], "serve_ingest_error")
+        self.assertIn("OSError", last["details"]["error"])
+        self.assertEqual(list(self.state.inbox.glob("*.aiit")), [])
+        self.assertEqual(self.request("POST", "/v1/bundles", p.read_bytes())[0], 200)  # same bundle once the disk is back
+
+    def test_incomplete_upload_is_400_and_leaves_no_temp_file(self):
+        conn = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        head = f"POST /v1/bundles HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 100000\r\n\r\n"
+        conn.sendall(head.encode("ascii") + b"x" * 10)
+        conn.shutdown(socket.SHUT_WR)  # the client goes away after 10 of the promised 100000 bytes
+        data = b""
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        conn.close()
+        self.assertRegex(data.split(b"\r\n", 1)[0].decode("ascii", "replace"), r"^HTTP/1\.[01] 400 ")
+        self.assertIn(b"incomplete upload", data)
+        self.assertEqual(sorted(self.state.inbox.glob("in-*")), [])
+        self.assertEqual(sorted(self.state.inbox.glob("*.aiit")), [])
+        self.assertEqual(self.request("GET", "/v1/health")[0], 200)
+
+    def test_bounded_concurrency_refuses_instead_of_queueing(self):
+        srv = make_server(self.state, "127.0.0.1", 0, TOKEN, max_concurrent=1)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        hog = socket.create_connection(("127.0.0.1", port))
+        try:
+            hog.sendall(b"POST /v1/bundles HTTP/1.1\r\nHost: x\r\n")  # holds the only slot; its headers never finish
+            time.sleep(0.3)
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/health", headers={"Authorization": f"Bearer {TOKEN}"})
+            t0 = time.time()
+            with self.assertRaises((urllib.error.URLError, http.client.HTTPException, OSError)):
+                urllib.request.urlopen(req, timeout=25)  # closed without a response once the 5 s slot wait expires
+            self.assertLess(time.time() - t0, 20)
+            hog.close()  # frees the slot; the next request is served normally
+            deadline = time.time() + 10
+            status = None
+            while time.time() < deadline:
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        status = resp.status
+                    break
+                except (urllib.error.URLError, http.client.HTTPException, OSError):
+                    time.sleep(0.2)
+            self.assertEqual(status, 200)
+        finally:
+            hog.close()
+            srv.shutdown()
+            srv.server_close()
 
 
 class TlsServerTests(ServerBase):

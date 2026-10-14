@@ -440,6 +440,22 @@ class LoadSaveTests(unittest.TestCase):
             Policy.from_dict({"deny_patterns": [bad]})
         self.assertIn(bad, str(cm.exception))
 
+    def test_bad_regex_in_every_list_is_rejected_at_load(self):
+        for key, value in (("allow_patterns", ["(x"]), ("reboot_patterns", ["["]), ("risk_floor_overrides", {"(": "high"})):
+            with self.assertRaises(ValueError, msg=key) as cm:
+                Policy.from_dict({key: value})
+            self.assertIn("invalid regex", str(cm.exception))
+            self.assertIn(repr(next(iter(value))), str(cm.exception))
+        # A pattern assigned after construction fails closed on the next evaluation, naming the pattern,
+        # and the policy works again once the list is fixed.
+        p = Policy()
+        p.allow_patterns = ["("]
+        with self.assertRaises(ValueError) as cm:
+            p.evaluate(step("df -h"), "linux")
+        self.assertIn("'('", str(cm.exception))
+        p.allow_patterns = []
+        self.assertTrue(p.evaluate(step("df -h"), "linux")[0])
+
     def test_old_format_without_new_keys_loads(self):
         old = {"version": "1", "mode": "enforce", "max_risk": "low", "deny_patterns": [r"\bfoo\b"]}
         p = Policy.from_dict(old)

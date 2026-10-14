@@ -1,18 +1,20 @@
 import json
 import os
+import re
 import sys
 import tempfile
 import types
 import unittest
+import unittest.mock as mock
 from pathlib import Path
-from unittest import mock
 
 from . import helpers
 from aiit.common.schema import FixPlanDraft
+from aiit.common.util import read_json
 from aiit.console.llm import ProviderError, ProviderOutputError, ProviderRefusal, get_provider
 from aiit.console.llm.base import LLMProvider
 from aiit.console.llm.ollama import OllamaProvider
-from aiit.console.planner import PRIORITY, _rank, build_context, diagnose, lint_plan
+from aiit.console.planner import PRIORITY, _rank, build_context, diagnose, lint_plan, plan_lifetime_hours
 
 VALID_PLAN = {"issue_summary": "x", "diagnosis": "y", "confidence": 0.7, "steps": [
     {"id": "s1", "title": "t", "rationale": "r", "action": "command", "os": "linux", "command": "df -h", "risk": "read_only"}]}
@@ -91,8 +93,12 @@ class OllamaProviderTests(unittest.TestCase):
         self.assertTrue(p.complete_json("s", "u", {}, {})[1]["context_truncated"])
 
 
-def _fake_anthropic(stop_reason="end_turn", text=None, beta_raises=False, category=None):
-    """Build a stand-in `anthropic` module with the exception classes and client shape the provider uses."""
+def _fake_anthropic(stop_reason="end_turn", text=None, beta_raises=False, category=None, beta_type_error=False, plain_type_error=False):
+    """Build a stand-in `anthropic` module with the exception classes and client shape the provider uses.
+
+    beta_type_error / plain_type_error imitate an SDK release that does not know the
+    `fallbacks`/`betas` or the `output_config` keyword (Python raises TypeError for those).
+    """
     mod = types.ModuleType("anthropic")
 
     class APIStatusError(Exception):
@@ -132,8 +138,12 @@ def _fake_anthropic(stop_reason="end_turn", text=None, beta_raises=False, catego
                 calls["beta"] += 1
                 if beta_raises:
                     raise BadRequestError("beta not available", 400)
+                if beta_type_error:
+                    raise TypeError("Messages.create() got an unexpected keyword argument 'fallbacks'")
             else:
                 calls["plain"] += 1
+                if plain_type_error:
+                    raise TypeError("Messages.create() got an unexpected keyword argument 'output_config'")
             return Response()
 
     class Anthropic:
@@ -180,6 +190,24 @@ class AnthropicProviderTests(unittest.TestCase):
         raw, usage = p.complete_json("s", "u", {}, {})
         self.assertEqual((calls["beta"], calls["plain"]), (1, 1))
         self.assertTrue(usage["fallbacks_degraded"])
+
+    def test_old_sdk_without_fallback_kwargs_degrades_once(self):
+        p, calls = self.provider(beta_type_error=True)
+        raw, usage = p.complete_json("s", "u", {}, {})
+        self.assertEqual((calls["beta"], calls["plain"]), (1, 1))
+        self.assertTrue(usage["fallbacks_degraded"])
+        self.assertEqual(raw["confidence"], 0.7)
+
+    def test_old_sdk_without_output_config_is_a_provider_error(self):
+        # with the beta path (TypeError there too) and with fallbacks disabled: both end in one plain call
+        for env, fake_kw in ((None, {"beta_type_error": True, "plain_type_error": True}), ({"AIIT_ANTHROPIC_FALLBACKS": "0"}, {"plain_type_error": True})):
+            p, calls = self.provider(env=env, **fake_kw)
+            with self.assertRaises(ProviderError) as cm:
+                p.complete_json("s", "u", {}, {})
+            self.assertNotIsInstance(cm.exception, (ProviderRefusal, ProviderOutputError))
+            self.assertIn("SDK too old", str(cm.exception))
+            self.assertIn("pip install -U anthropic", str(cm.exception))
+            self.assertEqual(calls["plain"], 1)
 
     def test_hipaa_mode_disables_beta(self):
         p, calls = self.provider(env={"AIIT_HIPAA_MODE": "1", "AIIT_LLM_TIMEOUT": "42", "AIIT_LLM_MAX_RETRIES": "5"})
@@ -246,7 +274,7 @@ class PlannerTests(unittest.TestCase):
 
     def test_repair_loop_recovers_and_audits(self):
         bad = {"issue_summary": "x", "diagnosis": "y", "confidence": 2.5, "steps": []}
-        provider = ScriptedProvider([bad, ProviderOutputError("garbage", raw_text="{{{"), VALID_PLAN])
+        provider = ScriptedProvider([bad, ProviderOutputError("garbage", raw_text="{{{ contact bob@example.org"), VALID_PLAN])
         with mock.patch.dict(os.environ, {"AIIT_PLAN_REPAIRS": "2"}):
             plan, warnings = diagnose(self.state, self.case_id, "it is slow", provider)
         self.assertEqual(plan.confidence, 0.7)
@@ -254,6 +282,13 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("Your previous answer was rejected", provider.prompts[1])
         self.assertIn("schema violation at confidence", provider.prompts[1])
         self.assertIn("could not be parsed", provider.prompts[2])
+        # The rejected answer is echoed back redacted and inside this request's data fence, so a model
+        # answer that quotes an identifier (or an instruction) is data to the next attempt, not a prompt.
+        p2 = provider.prompts[2]
+        delim = re.search(r"Data delimiter for this request: AIIT-DATA-([0-9a-f]+)", p2).group(1)
+        self.assertNotIn("bob@example.org", p2)
+        self.assertRegex(p2, r"\nPrevious answer \(for reference\):\n" + re.escape("<<<AIIT-DATA-" + delim) + r"\n"
+                         + re.escape("{{{ contact <EMAIL_") + r"[0-9a-f]{8}>\n" + re.escape("AIIT-DATA-" + delim + ">>>"))
         actions = [e["action"] for e in self.state.audit.entries()]
         self.assertIn("llm_invalid_plan", actions)
         self.assertIn("llm_output_error", actions)
@@ -269,8 +304,47 @@ class PlannerTests(unittest.TestCase):
             with self.assertRaises(ProviderError) as cm:
                 diagnose(self.state, self.case_id, "", provider)
         self.assertIn("rejected output is saved", str(cm.exception))
-        self.assertTrue(list((self.cdir / "plans").glob("rejected-*.json")))
+        rejected = list((self.cdir / "plans").glob("rejected-*.json"))
+        self.assertEqual(len(rejected), 1)
+        self.assertIn(str(rejected[0]), str(cm.exception))
+        if os.name != "nt":
+            self.assertEqual(rejected[0].stat().st_mode & 0o777, 0o600)  # "saved privately"
+        saved = read_json(rejected[0])
+        self.assertEqual(saved["raw"], "nope2")  # the last answer, verbatim, for the operator
+        self.assertTrue(any("could not be parsed" in p for p in saved["problems"]))
         self.assertEqual([p for p in (self.cdir / "plans").glob("plan-*.json")], [])
+
+    def test_diagnose_refuses_a_long_lifetime_before_calling_the_model(self):
+        provider = ScriptedProvider([VALID_PLAN])
+        with self.assertRaises(ValueError) as cm:
+            diagnose(self.state, self.case_id, "", provider, hours_valid=100)
+        self.assertIn("--long-lived", str(cm.exception))
+        self.assertEqual(provider.prompts, [])
+        self.assertNotIn("llm_request", [e["action"] for e in self.state.audit.entries()])
+        plan, _ = diagnose(self.state, self.case_id, "", provider, hours_valid=100, long_lived=True)
+        self.assertEqual(plan_lifetime_hours(plan), 100)
+
+    def test_previous_reports_are_fed_in_received_order(self):
+        # Report directories are named by random bundle id, so directory order says nothing about time;
+        # the prompt must follow case.json's received_at order and say which report is which.
+        plan_id = "plan-000000000001"
+        for bid, title, status in (("r-ffffffffffff", "FIRSTATTEMPT", "failed"), ("r-000000000000", "SECONDATTEMPT", "success")):
+            p = helpers.seal_report(self.state, self.agent, self.root / f"{bid}.aiit", self.case_id, plan_id,
+                                    [{"step_id": "s1", "title": title, "status": status}], bundle_id=bid)
+            self.state.ingest_bundle(p)
+        cj = self.cdir / "case.json"
+        case = read_json(cj)
+        self.assertEqual([r["bundle_id"] for r in case["reports"]], ["r-ffffffffffff", "r-000000000000"])
+        # unambiguous timestamps, stored in the opposite list order, to prove the sort key is received_at
+        case["reports"][0]["received_at"], case["reports"][1]["received_at"] = "2026-01-01T10:00:00+00:00", "2026-01-02T10:00:00+00:00"
+        case["reports"].reverse()
+        cj.write_text(json.dumps(case), encoding="utf-8")
+        ctx, _ = build_context(self.cdir, "", delimiter="abc123")
+        self.assertLess(ctx.index("r-ffffffffffff"), ctx.index("r-000000000000"))
+        self.assertLess(ctx.index("FIRSTATTEMPT"), ctx.index("SECONDATTEMPT"))
+        self.assertIn("## Previous execution report 1/2: r-ffffffffffff  plan=plan-000000000001  received=2026-01-01T10:00:00+00:00\n<<<AIIT-DATA-abc123\n", ctx)
+        self.assertIn("## Previous execution report 2/2: r-000000000000  plan=plan-000000000001  received=2026-01-02T10:00:00+00:00\n<<<AIIT-DATA-abc123\n", ctx)
+        self.assertEqual(ctx.count("## Previous execution report"), 2)
 
     def test_refusal_is_not_repaired(self):
         provider = ScriptedProvider([ProviderRefusal("no"), VALID_PLAN])
