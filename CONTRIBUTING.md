@@ -124,9 +124,9 @@ PYTHONPATH=src python3 -m unittest tests.test_policy.AllowListTests -v
 PYTHONPATH=src python3 -m unittest tests.test_policy.AllowListTests.test_non_matching_command_refused -v
 ```
 
-The real Windows and macOS collectors run only when
-`AIIT_RUN_REAL_COLLECTORS=1` is set (CI sets it on those runners); everything
-else is hermetic.
+`tests.test_e2e.RealCollectorSmokeTest` runs the real quick collectors for
+the OS it is on (it only checks that each produced a file), so it takes a few
+minutes on Windows; everything else is hermetic and fast.
 
 Static checks that CI also runs:
 
