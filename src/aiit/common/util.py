@@ -157,9 +157,11 @@ def atomic_write_bytes(path: Path, data: bytes, private: bool = False) -> None:
     """Write to a temp file in the same directory, fsync, then rename over the target.
 
     A crash mid-write leaves either the old file or the new file, never a torn one.
-    Private files are created 0600, other files 0640 (the directory, not the
-    file mode, decides who may read state), and the target name is never a
-    followed symlink.
+    Every file is created 0600 (nothing the tool writes needs to be readable
+    by another account; the operator copies enrollment files and plans by
+    hand), and the target name is never a followed symlink. ``private`` adds
+    an explicit chmod so the mode holds even where the creation mode is
+    widened.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,7 +171,7 @@ def atomic_write_bytes(path: Path, data: bytes, private: bool = False) -> None:
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_BINARY"):  # pragma: no cover - Windows
         flags |= os.O_BINARY
-    fd = os.open(tmp, flags, 0o600 if private else 0o640)
+    fd = os.open(tmp, flags, 0o600)
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
