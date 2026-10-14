@@ -1,16 +1,21 @@
 """Small helpers shared by agent and console."""
 from __future__ import annotations
 
+import contextlib
 import getpass
 import hashlib
 import json
 import os
 import platform
+import re
+import secrets
 import socket
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+ID_RE = re.compile(r"^[a-z]{1,16}-[0-9a-f]{12}$")
 
 
 def utcnow() -> datetime:
@@ -34,6 +39,26 @@ def in_hours(h: float) -> str:
 
 def new_id(prefix: str = "") -> str:
     return f"{prefix}{uuid.uuid4().hex[:12]}"
+
+
+def validate_id(value: Any, what: str = "id") -> str:
+    """Accept only ids shaped like new_id() output. Anything else from a header,
+    a manifest or the network is rejected before it can become a path component."""
+    if not isinstance(value, str) or not ID_RE.match(value):
+        raise ValueError(f"invalid {what}: {str(value)[:80]!r}")
+    return value
+
+
+def safe_join(base: Path, *parts: str) -> Path:
+    """Join parts under base and refuse anything that escapes it (absolute, drive, '..')."""
+    base_r = Path(base).resolve()
+    for part in parts:
+        if not isinstance(part, str) or not part or "\x00" in part:
+            raise ValueError(f"invalid path component: {str(part)[:80]!r}")
+    target = base_r.joinpath(*parts).resolve()
+    if target != base_r and base_r not in target.parents:
+        raise ValueError(f"path escapes {base_r}: {'/'.join(parts)[:120]!r}")
+    return target
 
 
 def canonical_json(obj: Any) -> bytes:
@@ -92,14 +117,76 @@ def ensure_private_dir(path: Path) -> Path:
     return path
 
 
-def write_private_file(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(data)
+@contextlib.contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """Cross-process exclusive lock on a sidecar <path>.lock file (msvcrt on Windows, flock elsewhere)."""
+    lock_path = Path(str(path) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        os.chmod(path, 0o600)
-    except Exception:  # pragma: no cover
-        pass
+        if os.name == "nt":  # pragma: no cover - exercised on the Windows runner
+            import msvcrt
+            import time as _time
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    _time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":  # pragma: no cover
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def atomic_write_bytes(path: Path, data: bytes, private: bool = False) -> None:
+    """Write to a temp file in the same directory, fsync, then rename over the target.
+
+    A crash mid-write leaves either the old file or the new file, never a torn one.
+    Private files are created 0600 and never follow a symlink at the target name.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_BINARY"):  # pragma: no cover - Windows
+        flags |= os.O_BINARY
+    fd = os.open(tmp, flags, 0o600 if private else 0o644)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if private and os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+
+
+def write_private_file(path: Path, data: bytes) -> None:
+    atomic_write_bytes(Path(path), data, private=True)
 
 
 def read_json(path: Path) -> Any:
@@ -109,11 +196,7 @@ def read_json(path: Path) -> Any:
 
 def write_json(path: Path, obj: Any, private: bool = False) -> None:
     data = json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    if private:
-        write_private_file(path, data)
-    else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+    atomic_write_bytes(Path(path), data, private=private)
 
 
 def truncate(text: str, limit: int) -> str:

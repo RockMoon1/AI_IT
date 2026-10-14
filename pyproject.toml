@@ -24,7 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=1.0"]
-dev = ["pre-commit>=3.5"]
+dev = ["pre-commit>=3.5", "coverage[toml]>=7.4", "bandit>=1.7", "pip-audit>=2.7"]
 
 [project.scripts]
 aiit-agent = "aiit.agent.cli:main"
@@ -35,3 +35,22 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.coverage.run]
+source = ["aiit"]
+branch = true
+parallel = true
+relative_files = true
+
+[tool.coverage.paths]
+aiit = ["src/aiit", "*/src/aiit", "*\\src\\aiit", "*/site-packages/aiit"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if __name__ == .__main__.:", "pragma: no cover", "if TYPE_CHECKING:"]
+
+[tool.bandit]
+# B404/B603: subprocess use is the product; every argv is a list, never a shell string.
+skips = ["B404", "B603"]
+exclude_dirs = ["tests"]

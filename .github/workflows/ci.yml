@@ -5,8 +5,15 @@ on:
     branches: ["**"]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+
+env:
+  COV_MIN: "70"
 
 jobs:
   secrets-scan:
@@ -27,7 +34,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.10", "3.12"]
+        python: ["3.10", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,5 +42,75 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install
         run: python -m pip install -e ".[dev]"
-      - name: Run tests
-        run: python -m unittest discover -s tests -t . -v
+      - name: Run tests with coverage
+        run: python -m coverage run -m unittest discover -s tests -t . -v
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-${{ matrix.python }}
+          path: .coverage.*
+          include-hidden-files: true
+          if-no-files-found: error
+
+  coverage:
+    name: Coverage gate
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+      - name: Combine and report
+        run: |
+          python -m coverage combine
+          python -m coverage report --fail-under=${COV_MIN}
+          python -m coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          python -m coverage html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: htmlcov
+
+  static:
+    name: Static analysis (bandit, pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: bandit
+        run: python -m bandit -r src -ll -ii -c pyproject.toml
+      - name: pip-audit (runtime dependencies only)
+        run: |
+          python -m venv /tmp/rt && /tmp/rt/bin/pip install --quiet . && /tmp/rt/bin/pip install --quiet pip-audit
+          /tmp/rt/bin/pip-audit --strict --progress-spinner off
+
+  install-from-wheel:
+    name: Install from wheel and run tests against it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build && python -m build
+      - name: Fresh venv, non-editable install, CLI smoke
+        run: |
+          python -m venv /tmp/w && /tmp/w/bin/pip install --quiet dist/*.whl
+          /tmp/w/bin/aiit-agent --help >/dev/null && /tmp/w/bin/aiit-console --help >/dev/null
+      - name: Offline install simulation (wheelhouse, no index)
+        run: |
+          python -m pip download --quiet -d wheelhouse dist/*.whl
+          python -m venv /tmp/o && /tmp/o/bin/pip install --quiet --no-index --find-links wheelhouse aiit
+          /tmp/o/bin/aiit-agent status
+      - name: Tests against the installed package
+        run: |
+          cd /tmp && AIIT_TEST_INSTALLED=1 /tmp/w/bin/python -m unittest discover -s "$GITHUB_WORKSPACE/tests" -t "$GITHUB_WORKSPACE"

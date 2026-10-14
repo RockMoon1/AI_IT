@@ -8,9 +8,10 @@ the Claude API under a BAA) for a structured fix plan, the operator approves
 and signs the plan, and the agent runs it under a local policy with a
 tamper-evident audit trail.
 
-Status: phase 0. The full offline loop works end to end on Linux in CI.
-Windows and macOS collectors are written and need field testing. See
-`docs/roadmap.md`.
+Status: phase 1 in progress. The full offline loop runs end to end in CI on
+Linux, Windows and macOS (3 OS x 4 Python versions, coverage-gated). The real
+Windows and macOS collectors pass a smoke test on GitHub runners; field tests on
+real laptops are still needed. See `docs/roadmap.md` and `CHANGELOG.md`.
 
 ## Why another tool
 
@@ -26,9 +27,9 @@ Operator machine:
 
 ```bash
 pip install -e .            # or: pip install aiit  (once published)
-cp .env.example .env        # edit; .env is git-ignored
 aiit-console init --label "clinic-helpdesk"
 # prints the public enrollment file to copy to endpoints
+cp .env.example ~/.aiit/console/.env   # settings live next to the console data, never in the repo
 ```
 
 Endpoint (can be offline; copy the wheel and the enrollment file over):
@@ -61,11 +62,13 @@ Operator machine:
 
 ```bash
 aiit-console report E:\report.aiit               # attach results to the case
-aiit-console audit-verify                        # hash chain intact?
+aiit-console audit verify                        # hash chain intact? (also: audit export --format html --out audit.html)
 ```
 
-LAN mode (`aiit-console serve`, `aiit-agent collect --push`, `aiit-agent pull`)
-moves the same files over HTTP with a shared token; nothing else changes.
+LAN mode (`aiit-console serve --tls-cert ... --tls-key ...`, `aiit-agent collect --push`,
+`aiit-agent push --outbox`, `aiit-agent pull`) moves the same files over HTTPS with a
+shared token; nothing else changes. A bind on anything but loopback requires TLS
+unless you pass `--insecure-no-tls` on a trusted LAN.
 
 ## Providers
 
@@ -78,14 +81,17 @@ moves the same files over HTTP with a shared token; nothing else changes.
 ## Secrets never reach git
 
 `.env`, keys, bundles, cases and signed plans are git-ignored. A gitleaks
-pre-commit hook and a CI secret scan back that up. See `SECURITY.md`.
+pre-commit hook and a CI secret scan back that up. The console reads its `.env`
+from its own data directory (or `--env-file`), never from the current directory.
+See `SECURITY.md` and `docs/security/threat-model.md`.
 
 ## Development
 
 ```bash
 python -m pip install -e ".[dev]"
 pre-commit install
-python -m unittest discover -s tests -t . -v
+python -m unittest discover -s tests -t . -v      # or scripts/run-tests.sh --coverage
+python -m bandit -r src -ll -ii -c pyproject.toml
 ```
 
 License: Apache-2.0.

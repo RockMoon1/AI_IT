@@ -38,6 +38,8 @@ venv/
 .ruff_cache/
 htmlcov/
 .coverage
+.coverage.*
+coverage.xml
 
 # ---- Editors / OS ----------------------------------------------------------
 .vscode/
