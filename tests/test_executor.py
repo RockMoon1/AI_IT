@@ -478,10 +478,13 @@ class WindowsShellTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "System32 PATH is Windows only")
     def test_windows_child_path_finds_system32_tools_by_bare_name(self):
         # A step naming a native tool (as the policy's own dry run plan does with sfc) must resolve it.
-        step = PlanStep(id="s1", title="where", rationale="r", action="command", command="ipconfig | Select-Object -First 1", risk="read_only")
+        # A plain native command, no pipeline: `ipconfig | Select-Object -First 1`
+        # made Windows PowerShell exit non-zero when it stopped the pipeline early.
+        step = PlanStep(id="s1", title="where", rationale="r", action="command", command="hostname", risk="read_only")
         result = run_step(step, "windows")
-        self.assertEqual(result.status, "success", result.stderr)
+        self.assertEqual(result.status, "success", (result.stdout, result.stderr))
         self.assertNotIn("not recognized", result.stderr)
+        self.assertTrue(result.stdout.strip(), "hostname printed nothing")
 
 
 if __name__ == "__main__":
