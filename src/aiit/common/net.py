@@ -22,6 +22,8 @@ from typing import Any, Callable
 
 RETRY_STATUSES = (408, 425, 429, 500, 502, 503, 504)
 MAX_RESPONSE = 4 * 1024 * 1024
+ALLOWED_SCHEMES = ("http", "https")
+_sleep = time.sleep  # tests patch this instead of the global time module
 
 
 class NetError(Exception):
@@ -61,7 +63,7 @@ def http_json(
     backoff: float = 0.5,
     max_backoff: float = 8.0,
     retry_statuses: tuple[int, ...] = RETRY_STATUSES,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] | None = None,
     max_response: int = MAX_RESPONSE,
     raw_body: bytes | None = None,
     expect_json: bool = True,
@@ -75,6 +77,10 @@ def http_json(
     """
     if retries is None:
         retries = _default_retries()
+    sleeper = sleep or _sleep
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ALLOWED_SCHEMES:
+        raise NetError(f"unsupported URL scheme {scheme!r} for {url}")
     data: bytes | None
     hdrs = dict(headers or {})
     if raw_body is not None:
@@ -94,7 +100,7 @@ def http_json(
         req = urllib.request.Request(url, data=data, method=method.upper(), headers=hdrs)
         retry_after: float | None = None
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 - scheme checked above
                 raw = _read_capped(resp, max_response)
                 if not expect_json:
                     return raw
@@ -127,7 +133,7 @@ def http_json(
                 raise err from e
         # retry path
         delay = retry_after if retry_after is not None else min(max_backoff, backoff * (2 ** (attempt - 1))) * random.random()
-        sleep(delay)
+        sleeper(delay)
         if attempt > retries:  # pragma: no cover - defensive; loop exits above
             raise err
 

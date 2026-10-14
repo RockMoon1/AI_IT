@@ -76,11 +76,11 @@ class OllamaProviderTests(unittest.TestCase):
 
     def test_timeout_and_unreachable_are_provider_errors(self):
         self.srv.queue(200, self.reply("{}"), delay=1.5)
-        with mock.patch("aiit.common.net.time.sleep"):
+        with mock.patch("aiit.common.net._sleep"):
             with self.assertRaises(ProviderError) as cm:
                 OllamaProvider(url=self.srv.url, model="fake", timeout=0.3).complete_json("s", "u", {}, {})
         self.assertIn("timeout", str(cm.exception).lower())
-        with mock.patch("aiit.common.net.time.sleep"):
+        with mock.patch("aiit.common.net._sleep"):
             with self.assertRaises(ProviderError):
                 OllamaProvider(url="http://127.0.0.1:9", model="fake", timeout=2).complete_json("s", "u", {}, {})
 

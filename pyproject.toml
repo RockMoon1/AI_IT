@@ -52,5 +52,6 @@ exclude_also = ["if __name__ == .__main__.:", "pragma: no cover", "if TYPE_CHECK
 
 [tool.bandit]
 # B404/B603: subprocess use is the product; every argv is a list, never a shell string.
-skips = ["B404", "B603"]
+# B104: `serve --host 0.0.0.0` is the documented LAN mode and refuses to start without TLS unless --insecure-no-tls.
+skips = ["B404", "B603", "B104"]
 exclude_dirs = ["tests"]

@@ -1,0 +1,18 @@
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.1 167892 11234 ?        Ss   Oct13   0:02 /sbin/init splash
+root           2  0.0  0.0      0     0 ?        S    Oct13   0:00 [kthreadd]
+root         612  0.0  0.2  47212  9876 ?        Ss   Oct13   0:01 /lib/systemd/systemd-journald
+systemd+     701  0.0  0.1  25012  6432 ?        Ss   Oct13   0:00 /lib/systemd/systemd-resolved
+root         845  0.0  0.1  15420  7788 ?        Ss   Oct13   0:00 sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups
+postgres    1402  0.0  0.5 221844 20412 ?        Ss   Oct13   0:08 /usr/lib/postgresql/14/bin/postgres -D /var/lib/postgresql/14/main -c config_file=/etc/postgresql/14/main/postgresql.conf
+www-data    1510  0.0  0.1  55876  5120 ?        S    Oct13   0:00 nginx: worker process
+jsmith      1823  0.3  2.1 912344 84512 ?        Sl   Oct13   1:15 /usr/lib/firefox/firefox --profile /home/jsmith/.mozilla/firefox/ab12cd34.default-release
+jsmith      2210  0.0  0.1  12345  5120 pts/0    S+   09:12   0:00 mysql -u appuser --password=Tr0ub4dor-3 -h db.clinic.local appdb
+jsmith      2241  1.2  4.0 3123456 162000 ?      Sl   09:14   0:41 java -Dspring.datasource.url=postgres://admin:hunter22@db.clinic.local:5432/clinic -Dapi.token=tok-EXAMPLE-0000000000000000 -jar /opt/clinic/app.jar --auth-header "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJqc21pdGgifQ.ZmFrZS1zaWduYXR1cmUtMDAwMA"
+jsmith      2410  0.0  0.3  98012 12100 pts/1    S    09:20   0:00 /usr/bin/python3 /home/jsmith/scripts/sync.py --api-key AIzaEXAMPLE000000000000000000000000000 --endpoint https://api.example.net/v1
+jsmith      2455  0.0  0.1  10234  4096 pts/1    S    09:21   0:00 aws s3 ls --profile clinic
+root        2460  0.0  0.1  12000  4200 ?        S    09:21   0:00 /usr/bin/env AWS_ACCESS_KEY_ID=AKIAEXAMPLE000000000 AWS_SECRET_ACCESS_KEY=EXAMPLE0000000000000000000000000000000000 /opt/backup/run.sh
+jsmith      2501  0.0  0.1   9800  3900 pts/0    S    09:25   0:00 ssh -p 2222 jsmith@bastion.clinic.local
+root        2600  0.0  0.1  16000  6000 ?        Ss   09:30   0:00 sshd: jsmith [priv]
+jsmith      2601  0.0  0.1  16000  4000 ?        S    09:30   0:00 sshd: jsmith@pts/2
+jsmith      2650  0.0  0.1  12000  4000 pts/2    R+   09:31   0:00 ps aux

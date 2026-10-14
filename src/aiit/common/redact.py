@@ -104,7 +104,7 @@ SECRET_RULES: list[_SecretRule] = [
     # mysql/mariadb style -pSECRET (no space) and the quoted -p'x' form anywhere
     _SecretRule("mysql_p", re.compile(
         r"(?i)\b(?:mysql\w*|mariadb\w*)\b[^\r\n]*?(?<=\s)-p(?!\s)[\"']?([^\s\"']+)[\"']?"), (1,)),
-    _SecretRule("quoted_p", re.compile(r"(?<![\w-])-p(?:'([^'\r\n]+)'|\"([^\"\r\n]+)\")"), (1, 2)),
+    _SecretRule("quoted_p", re.compile(r"(?<![\w-])-p(?:'([^'\r\n<>]+)'|\"([^\"\r\n<>]+)\")"), (1, 2)),
     # well-known token shapes
     _SecretRule("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     _SecretRule("aws_secret", re.compile(
@@ -141,7 +141,9 @@ IPV6 = re.compile(r"(?<![A-Za-z0-9:.])(?=[0-9A-Fa-f]{0,4}:)([0-9A-Fa-f:]{2,}(?:%
 MAC = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
 # C:\Users\name, C:\\Users\\name (JSON-escaped) and C:/Users/name
 WIN_USER_PATH = re.compile(r"(?i)(?<![A-Za-z0-9])([A-Z]:(?:\\\\|\\|/)Users(?:\\\\|\\|/))([^\\/\s\"'<>]+)")
-NIX_USER_PATH = re.compile(r"(/(?:home|Users)/)([^/\s\"'<>]+)")
+# /home/name, /Users/name, and the same segments with one or two backslashes
+# (UNC home shares such as \\\\server\\home\\name).
+NIX_USER_PATH = re.compile(r"((?:/|\\{1,2})(?:home|Users)(?:/|\\{1,2}))([^\\/\s\"'<>]+)")
 # scheme://user@host  (user only; user:password@ was already removed as a secret)
 URL_USER = re.compile(r"(?i)\b[a-z][a-z0-9+.\-]{1,15}://([^\s/@:\"'<>]{1,64})@")
 # DOMAIN\user and DOMAIN\\user. The label is a NetBIOS-style name (all upper or
@@ -154,7 +156,7 @@ DOMAIN_USER = re.compile(
 # do not match these shapes and are kept.
 SID = re.compile(r"\bS-1-(?:5-21-\d+-\d+-\d+(?:-\d+)?|12-1-\d+-\d+-\d+-\d+)\b")
 # \\server\share and \\\\server\\share (JSON-escaped); the server name is tokened.
-UNC = re.compile(r"(?<![A-Za-z0-9_:\\/])\\\\(?:\\\\)?([A-Za-z0-9][A-Za-z0-9._\-]{1,253})(?![A-Za-z0-9._\-])")
+UNC = re.compile(r"(?<![A-Za-z0-9_:\\/>])\\\\(?:\\\\)?([A-Za-z0-9][A-Za-z0-9._\-]{1,253})(?![A-Za-z0-9._\-])")
 MRN = re.compile(r"(?i)\b(?:MRN|medical record(?: number)?|patient id)\s*[:#]?\s*([A-Z0-9-]{4,})")
 DOB = re.compile(r"(?i)\b(?:DOB|date of birth|birth ?date)\s*[:#]?\s*(\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4})")
 
@@ -336,7 +338,8 @@ class Redactor:
                 self.stats.bump("SECRET")
                 return SECRET_TOKEN
             base = m.start()
-            spans = sorted((m.start(g) - base, m.end(g) - base) for g in rule.groups if m.group(g))
+            spans = sorted((m.start(g) - base, m.end(g) - base) for g in rule.groups
+                           if m.group(g) and m.group(g) != SECRET_TOKEN)
             if not spans:
                 return whole
             out: list[str] = []

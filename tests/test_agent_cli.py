@@ -110,7 +110,7 @@ class PullTests(AgentCliBase):
 
     def test_server_errors_are_clean(self):
         self.srv.queue(500, "boom").queue(500, "boom").queue(500, "boom")
-        with mock.patch("aiit.common.net.time.sleep"):
+        with mock.patch("aiit.common.net._sleep"):
             code, out = self.agent_exit("pull", self.srv.url, "--token", TOKEN)
         self.assertEqual(code, 1)
         self.assertIn("Pull failed: HTTP 500", out)
@@ -131,7 +131,7 @@ class PushTests(AgentCliBase):
         self.agent("collect", "--quick", "--no-osquery")
         bundle = next(self.state.outbox.glob("*.aiit"))
         self.srv.queue(503, "busy").queue(200, {"case_id": "case-000000000001", "kind": "diagnostics"})
-        with mock.patch("aiit.common.net.time.sleep"):
+        with mock.patch("aiit.common.net._sleep"):
             out = self.agent("push", "--outbox", "--server", self.srv.url, "--token", TOKEN)
         self.assertIn("Pushed", out)
         self.assertFalse(bundle.exists())
@@ -144,7 +144,7 @@ class PushTests(AgentCliBase):
         self.agent("collect", "--quick", "--no-osquery", "--out", str(out_path))
         for _ in range(4):
             self.srv.queue(500, "down")
-        with mock.patch("aiit.common.net.time.sleep"):
+        with mock.patch("aiit.common.net._sleep"):
             code, out = self.agent_exit("push", str(out_path), "--server", self.srv.url, "--token", TOKEN)
         self.assertEqual(code, 3)
         self.assertIn("Bundle kept at", out)

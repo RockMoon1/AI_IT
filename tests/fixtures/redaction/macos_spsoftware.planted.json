@@ -1,0 +1,33 @@
+{
+  "must_not_survive": [
+    "Janes-MacBook-Pro",
+    "Jane Smith",
+    "jsmith",
+    "6F1A2B3C-4D5E-6F70-8192-A3B4C5D6E7F8",
+    "00008112-000A1B2C3D4E5F67",
+    "C02ZX1ABCD12",
+    "a4:b5:c6:d7:e8:f9",
+    "2600:1f18:1234:5678:1c2d:3e4f:5a6b:7c8d",
+    "2606:4700:4700::1111",
+    "Summer2024!",
+    "clinic-fs-01"
+  ],
+  "must_survive": [
+    "Macintosh HD",
+    "Darwin 23.6.0",
+    "macOS 14.6.1 (23G93)",
+    "Apple M2",
+    "Mac14,2",
+    "MacBook Air",
+    "MLXW3LL/A",
+    "proc 8:4:4",
+    "up 3:02:14:33",
+    "fe80::1c2d:3e4f:5a6b:7c8d",
+    "192.168.10.88",
+    "/Users/Shared/clinic",
+    "2A1B3C4D-5E6F-7081-92A3-B4C5D6E7F8A9",
+    "en0"
+  ],
+  "secrets": ["Summer2024!"],
+  "config": {"redact_hostnames": ["clinic.local", "clinic-fs-01"]}
+}

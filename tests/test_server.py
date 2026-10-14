@@ -86,7 +86,7 @@ class PlainServerTests(ServerBase):
 
     def test_auth_failures_and_backoff(self):
         self.assertEqual(self.request("GET", "/v1/health", token=None)[0], 401)
-        for _ in range(server_mod.AUTH_FAIL_LIMIT):
+        for _ in range(server_mod.AUTH_FAIL_LIMIT - 1):
             self.assertEqual(self.request("GET", "/v1/health", token="wrong-token-wrong-token")[0], 401)
         status, _, hdrs = self.request("GET", "/v1/health", token=TOKEN)
         self.assertEqual(status, 429)
