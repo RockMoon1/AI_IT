@@ -52,7 +52,7 @@ class FakeHTTP:
                 body = self.rfile.read(n) if n else b""
                 with outer._lock:
                     outer.requests.append({
-                        "method": self.command, "path": self.path, "headers": dict(self.headers.items()), "body": body,
+                        "method": self.command, "path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body,
                     })
                     reply = outer.replies.pop(0) if outer.replies else (200, {}, {"ok": True}, 0)
                 status, headers, payload, delay = reply

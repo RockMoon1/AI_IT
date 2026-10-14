@@ -265,7 +265,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
 
     report = apply_plan(sp, policy, ident.id, st.audit, dry_run=dry, allow_reboot=args.allow_reboot, os_name=current_os(),
                         skip_step_ids=skip or None, on_step=on_step if effective.startswith("ENFORCE") else None)
-    if report.mode == "enforce":
+    if report.mode == "enforce" and not blocked:
         st.mark_applied(sp.plan.plan_id)
         st.clear_applying()
     report.audit_head = st.audit.head()

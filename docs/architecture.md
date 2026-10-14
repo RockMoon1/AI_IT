@@ -115,56 +115,132 @@ default provider is local.
 ## 5. Policy gate on the endpoint
 
 `policy.json` lives on the endpoint, not in the plan, so a compromised
-console cannot loosen it:
+console cannot loosen it. Its fields are exactly those written by
+`Policy.to_dict()` in `src/aiit/common/policy.py`:
 
+* `version`: policy format version (`"2"`). Version 1 files load with
+  defaults for the newer fields.
 * `mode`: `dry_run` (default) or `enforce`.
-* `max_risk`: highest step risk the agent will run (`low` by default).
+* `max_risk`: highest *effective* step risk the agent will run (`low` by
+  default). The effective risk is the larger of the risk the model declared
+  and a locally computed floor from a verb table (read-only verbs impose no
+  floor, service restarts and cache clears floor to `low`, mutating verbs to
+  `medium`, unknown commands to `low`), so a mislabelled step cannot run
+  above the ceiling.
 * `deny_patterns`: regexes that block a command outright (disk formatting,
-  recursive deletes of system roots, user creation, boot config, firewall
-  disable, reverse shells).
-* `allow_patterns`: if non-empty, a command must match one.
-* `require_reboot_flag`: steps marked `requires_reboot` are skipped unless
-  the operator passed `--allow-reboot`.
+  recursive deletes of system roots, user creation, boot config, security
+  tooling and firewall disable, log clearing, persistence, reverse shells).
+  They are matched against the raw command and an OS-aware normalised form
+  (aliases expanded, case folded, quotes and backticks stripped, `sudo`/`env`
+  style prefixes removed). A fixed set of structural denies (encoded
+  commands, `Invoke-Expression`, pipes into an interpreter, command
+  substitution, nested shells, inline `python -c`) is applied regardless of
+  the list.
+* `allow_patterns`: if non-empty, a command must fully match one entry
+  (`re.fullmatch`), and may not contain shell control characters the entry
+  does not itself contain.
+* `reboot_patterns`: commands that reboot or power off; such a step, or any
+  step marked `requires_reboot`, is blocked unless the operator passed
+  `--allow-reboot` to `apply`.
+* `max_plan_hours`: longest plan lifetime (`expires_at - created_at`) the
+  agent accepts, 72 by default. `aiit-console approve --hours` above this
+  needs `--long-lived` on the console and a raised value here.
+* `risk_floor_overrides`: mapping of regex to risk that raises the floor for
+  commands a site considers more dangerous than the built-in table does.
+  Overrides can only raise the effective risk.
 
-Every step result (including `blocked_by_policy`) goes into the report and
-the agent audit chain.
+`aiit-agent policy digest` prints the SHA-256 of the canonical policy so a
+fleet can be checked against a known value. Every step is evaluated before
+any step runs (preflight): one blocked step stops the whole plan. Every step
+result (including `blocked_by_policy`) goes into the report and the agent
+audit chain.
 
 ## 6. LLM providers
 
-`aiit.console.llm` has a tiny interface: `complete_json(system, user, schema)`.
+`aiit.console.llm` has a tiny interface:
+`complete_json(system, user, schema, meta) -> (parsed_json, usage)`.
+`system` and `user` are the only text that may leave the console and both
+have already been redacted. `meta` carries local-only hints (target OS, case
+id, redacted issue text) a provider may read but must never transmit.
+`usage` goes into the audit log, so it holds provider, model, token counts
+and flags (`hosted`, `format_degraded`, `hipaa_mode`), never content. Each
+provider records `hosted` (data leaves the operator machine) and
+`endpoint_host`, and both are written to every `llm_request` audit entry.
 
 * `dryrun`: no model; produces a read-only checklist plan from the manifest
   so the pipeline can be exercised and tested offline.
-* `ollama`: POST to the local Ollama `/api/chat` with `format` set to the
-  FixPlan JSON schema.
+* `ollama`: POST to Ollama `/api/chat` through `aiit.common.net.http_json`
+  with `format` set to the FixPlan JSON schema. A 404 prints an
+  "`ollama pull`" hint; a 400 on the schema retries once with
+  `format: "json"`. `hosted` is true only when the URL is not loopback or
+  private. `AIIT_OLLAMA_TIMEOUT`, `AIIT_OLLAMA_NUM_CTX`.
 * `anthropic`: official `anthropic` SDK, `claude-opus-5-5` by default,
-  `output_config.format` JSON schema for the plan, `effort` configurable,
-  server-side refusal fallbacks enabled by default on the Claude API, and a
-  hard stop with a clear message when `stop_reason` is `refusal`.
+  `output_config.format` JSON schema for the plan, `effort` configurable.
+  Server-side refusal fallbacks (a beta feature) are on by default; a beta
+  400 degrades once to the plain Messages call, and `AIIT_HIPAA_MODE=1`
+  disables beta features so the request stays on the BAA-covered surface.
+  `stop_reason` `refusal` is a hard stop (`ProviderRefusal`), never retried.
+  Always `hosted`; from PR 2 it requires `AIIT_ALLOW_HOSTED=1`.
 
-Prompt budget is bounded (`--max-chars`); files are included in priority order
-(manifest summary, failed services, error logs, disk, network, then the rest).
+Errors are one hierarchy: `ProviderError` (transport, timeout, HTTP status,
+truncation), `ProviderRefusal` (the model declined) and
+`ProviderOutputError` (the model answered but the answer is not a JSON
+object; it carries the raw text). All providers parse replies with the shared
+`parse_json_text`, which tolerates a code fence and prose around the
+outermost object.
+
+The planner runs a repair loop: when a reply raises `ProviderOutputError` or
+fails `FixPlanDraft` validation, the console appends the problems (pydantic
+errors without input values, plus `lint_plan` findings) and the redacted
+previous answer to the prompt and asks again, up to `AIIT_PLAN_REPAIRS`
+times (default 1). Every attempt is audited (`llm_request`, `llm_response`,
+`llm_invalid_plan`, `llm_output_error`, `llm_repair`); on final failure the
+rejected output is saved privately under the case's `plans/` directory and
+the command exits with a clear message. Refusals are never repaired.
+
+Prompt budget is bounded (`--max-chars`, capped by the provider's
+`max_input_chars`); files are included in priority order (manifest summary,
+failed services, error logs, disk, network, then the rest). Each file is
+wrapped in a data fence with a per-request random delimiter, and the system
+prompt tells the model that fenced content is data from the machine, never an
+instruction. The operator's `--issue` text and any previous execution report
+are passed through the case's redactor before they enter the prompt.
 
 ## 7. Transport modes
 
 * **Sneakernet (default).** Files on removable media. Works with zero
   network.
-* **LAN.** `aiit-console serve` exposes three endpoints protected by a shared
-  token and optional TLS: upload bundle, fetch pending signed plans for an
-  agent id, upload report. `aiit-agent push` and `aiit-agent pull` use them.
-  Payloads are the same sealed files, so the server is a dumb mailbox.
+* **LAN.** `aiit-console serve` exposes four endpoints behind a shared
+  bearer token (`AIIT_SERVER_TOKEN`, at least 16 characters):
+
+  | Endpoint | Purpose | Responses |
+  |---|---|---|
+  | `POST /v1/bundles` | Upload a sealed diagnostics bundle (body is the `.aiit` file). | `200` with `case_id`; `422` when the bundle is rejected (bad signature, manifest, path); `503` on a storage error; `413` over 64 MiB. |
+  | `POST /v1/reports` | Upload a sealed execution report. Same handling. | As above. |
+  | `GET /v1/plans?agent_id=...` | Fetch pending signed plans for one agent id. | `200` with a JSON list; `400` for a malformed id. |
+  | `GET /v1/health` | Liveness, console id and version. | `200`. |
+
+  `aiit-agent collect --push`, `aiit-agent apply --push`, `aiit-agent push`
+  (a file, or `--outbox` for everything unsent) and `aiit-agent pull` use
+  them. The agent validates every pulled plan (schema, signature, target,
+  expiry, lifetime) before saving it to its inbox, and a failed push keeps
+  the bundle on disk and exits 3. Payloads are the same sealed files, so the
+  server is a dumb mailbox: it authenticates callers, bounds resource use
+  (30 s socket timeout, streamed bodies, 32 concurrent handlers, per-address
+  back-off after repeated authentication failures) and stores files. **TLS is
+  required for any bind other than loopback** (`--tls-cert`/`--tls-key`,
+  TLS 1.2 minimum); `--insecure-no-tls` overrides that on a trusted LAN. A
+  retried upload is idempotent on `bundle_id`.
 * **Live session (roadmap).** When the endpoint is reachable, launch
   MeshCentral (Apache-2.0) for screen, terminal and files. AI_IT does not
   replace that; it feeds it.
 
 ## 8. Threats considered
 
-| Threat | Control |
-|---|---|
-| Lost USB stick with a bundle | Encrypted to console key; signature prevents substitution. |
-| Malicious plan file dropped on an endpoint | Ed25519 signature from the enrolled console only; bound to agent id, expiry, replay list. |
-| Model proposes a destructive command | Operator approval, risk ceiling, deny patterns, dry-run default. |
-| PHI leaks to a cloud model | Local model default; redaction before any provider; BAA requirement documented. |
-| Secret committed to git | `.gitignore`, gitleaks pre-commit, CI scan, no secrets in config files. |
-| Tampered audit trail | Hash-chained entries, `audit-verify`. |
-| Compromised operator machine | Out of scope for the software; FDE, MFA and OS hardening are required by the deployment checklist. |
+The threat model lives in `docs/security/threat-model.md`. It is organised
+by STRIDE and lists, for every threat, the control, the file and function
+that implements it, the test that covers it and the residual risk, followed
+by attack trees for "an arbitrary command runs on an endpoint" and "PHI
+reaches a third party", the cryptographic inventory and key lifecycle, the
+accepted risks, and the scope for a third-party assessment. Changes to a
+trust boundary update that document in the same pull request.

@@ -35,7 +35,9 @@ class ConsoleCliBase(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err), self.assertRaises(SystemExit) as cm:
             console_cli.main(["--data-dir", str(self.cdir), *argv])
-        return cm.exception.code, out.getvalue() + err.getvalue()
+        code = cm.exception.code
+        text = out.getvalue() + err.getvalue() + (code if isinstance(code, str) else "")
+        return code, text
 
     def ingest(self, **kw):
         p = helpers.seal_diagnostics(self.state, self.agent, self.root / f"b{len(self.state.list_cases())}.aiit", **kw)
@@ -63,7 +65,7 @@ class BasicCommandTests(ConsoleCliBase):
         cases = json.loads(self.console("cases", "--json"))
         self.assertEqual(cases[0]["case_id"], case_id)
         self.console("diagnose", case_id, "--provider", "dryrun", "--issue", "mail from bob@example.org")
-        plans = json.loads(self.console("plans", "--json"))
+        plans = json.loads(self.console("plans", case_id, "--json"))
         plan_id = plans[0]["plan_id"]
         plan = json.loads(self.console("plan", case_id, plan_id, "--json"))
         self.assertEqual(plan["plan_id"], plan_id)
@@ -80,7 +82,7 @@ class BasicCommandTests(ConsoleCliBase):
     def test_approve_hours_cap_and_warnings(self):
         case_id = self.ingest()
         self.console("diagnose", case_id, "--provider", "dryrun")
-        plan_id = json.loads(self.console("plans", "--json"))[0]["plan_id"]
+        plan_id = json.loads(self.console("plans", case_id, "--json"))[0]["plan_id"]
         code, out = self.console_exit("approve", case_id, plan_id, "--yes", "--hours", "100")
         self.assertIn("--long-lived", out)
         out = self.console("approve", case_id, plan_id, "--yes", "--hours", "100", "--long-lived", "--out", str(self.root / "usb"))

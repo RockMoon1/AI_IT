@@ -66,8 +66,8 @@ class HttpJsonTests(unittest.TestCase):
         http_json("POST", self.srv.url + "/v1/bundles", raw_body=b"\x00\x01", headers={"Authorization": "Bearer t"}, retries=0)
         req = self.srv.requests[0]
         self.assertEqual(req["body"], b"\x00\x01")
-        self.assertEqual(req["headers"]["Content-Type"], "application/octet-stream")
-        self.assertEqual(req["headers"]["Authorization"], "Bearer t")
+        self.assertEqual(req["headers"]["content-type"], "application/octet-stream")
+        self.assertEqual(req["headers"]["authorization"], "Bearer t")
 
     def test_private_detection(self):
         self.assertTrue(is_loopback_or_private("http://127.0.0.1:11434"))

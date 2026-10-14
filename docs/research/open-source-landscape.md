@@ -109,8 +109,10 @@ ollama-agent). Reported caveats that shaped our design:
   expected outcome, and a human approves it. The model never has a live
   shell.
 * Tool calling reliability varies by local model. We use Ollama's JSON schema
-  `format` option and validate the result with pydantic, and fall back to a
-  dry-run plan if the output is unusable.
+  `format` option and validate the result with pydantic; unusable output is
+  fed back to the model for a bounded number of repair attempts, and the
+  operator can choose an explicit `--fallback dryrun` option (never
+  automatic, always audited) to get a read-only checklist instead.
 
 ## 6. Decision
 

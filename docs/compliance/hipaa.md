@@ -41,6 +41,36 @@ Diagnostic data from a clinic laptop can contain it even though the tool is
 
 So the design assumption is: **treat every bundle as if it contains PHI**.
 
+### Residual exposure per collector
+
+The redactor (`src/aiit/common/redact.py`) is a regex layer. The table below
+says, collector by collector, what it catches and what it does not, so an
+operator can decide what to exclude (`--quick` skips the collectors marked
+*full only*) and what to add with `aiit-console ingest --redact <literal>`.
+"Caught" means replaced with a per-case token or, for secrets, removed
+irreversibly. Collector names are those in `src/aiit/agent/collectors.py`.
+
+| Collector (OS) | Can carry | Redactor catches | Redactor does not catch |
+|---|---|---|---|
+| `application_errors_7d`, `system_errors_7d`, `windows_update`, `kernel_power_bugchecks` (Windows), `journal_errors`, `journal_boot`, `dmesg_err` (Linux), `log_errors_30m` (macOS) | Free-text crash and error messages: patient names, MRNs after a label, document paths, email subjects, usernames in paths, URLs with credentials. | Emails, phones, SSNs, labelled MRN and date of birth, user profile paths (`C:\Users\<name>`, `/home/<name>`, `/Users/<name>`), `DOMAIN\user`, SIDs, UNC server names, IPs, MACs, hostnames, secrets in key/value or header form, URL userinfo, harvested usernames. | **Names and addresses in prose**, file names that are a patient name without a profile path, MRNs with no label, dates of birth with no label, free-text clinical content. Highest-risk collectors; review `preview` output before any hosted provider call. |
+| `processes_top` (all), `connections` / `listening` (Windows, Linux), `startup`, `scheduled_tasks` (Windows) | Window titles and document paths in command lines, usernames in process owner columns, remote IPs, URLs. | User paths, usernames harvested from the account collectors, IPs, MACs, URL credentials, secrets passed as flags (`--password x`, `-p'x'`). | A document name in a command line argument, an application-specific identifier format. |
+| `computerinfo`, `systeminfo`, `hostnamectl`, `hardware` (macOS `SPHardwareDataType` / `SPSoftwareDataType`), osquery `system_info` | Hostname, registered owner and organisation, logged-on user, serial number, UUIDs, machine id, domain. | Labelled hostname, computer name, domain, DNS suffix, user name, registered owner and organisation, serial numbers, UUID/UDID/machine id (when labelled), harvested usernames. | Unlabelled serial-looking strings; an owner name that appears elsewhere without its label is caught only because the labelled value is propagated through the whole file. |
+| `local_users`, osquery `logged_in_users` | Account names, display names. | Account names (harvested into the redaction literals for the whole case); `Display Name (account)` pairs. | Display names that differ from the account name and appear only here without a label. |
+| `ipconfig`, `adapters`, `routes`, `dns`, `ip_addr`, `ip_route`, `resolv_conf`, `ifconfig`, `network`, osquery `interface_addresses` | IP addresses (public by default; private optional), MAC addresses, DNS suffixes, hostnames. | Public IPv4 and IPv6, MACs, labelled DNS suffixes and hostnames, UNC server names. Private IPs with `--redact-private-ips`. | Private IPs by default (deliberate: the model often needs them for network diagnosis); network names that are a site name. |
+| `installed_software`, `hotfixes`, `drivers`, `pnp_errors`, `services`, `services_stopped_auto`, `launchd`, `running_services`, `failed_units` | Vendor and product names (may reveal an EHR vendor), service accounts. | `DOMAIN\user` service accounts, SIDs. | Product names; not PHI by themselves. |
+| `volumes`, `disks`, `disk_df`, `lsblk`, `mounts`, `storage`, `diskutil`, `disk_usage`, osquery `disk_encryption` | Volume labels, mounted share paths with server names. | UNC server names, user paths on mounted volumes. | A volume label that is a person's name. |
+| `hosts_file`, `fstab`, `crontab`, `proxy`, `apt_history` | Hostnames and IPs, share paths, proxy credentials, cron entries with user paths. | Hostnames (when labelled or when in the hostname list), IPs, URL userinfo, user paths. | Hostnames in `/etc/hosts` that are not labelled and not the endpoint's own name. Add them with `--redact`. |
+| `env_names` | Names of environment variables only. | Values are never collected. | A variable *name* that embeds a username (`USERPROFILE_JSMITH`); rare. |
+| `defender`, `bitlocker`, `firewall_profiles`, `security`, `power`, `printers`, `battery`, `updates_history`, `uptime*`, `os_release`, `uname`, `sw_vers`, `python_platform` | Little; printer names and node name. | Hostname in `python_platform` (`node`), labelled values. | A printer name that is a person's name. |
+
+Two environment switches matter for this table. `AIIT_HIPAA_MODE=1` keeps
+Anthropic requests on the generally available, BAA-covered API surface by
+disabling beta features (server-side refusal fallbacks); set it on every
+console that handles PHI. `AIIT_ALLOW_HOSTED=1` (or `--allow-hosted`),
+arriving in PR 2, is required before any hosted provider is used at all; the
+console refuses otherwise, which makes "nothing leaves this machine" the
+default rather than a convention.
+
 ## 3. Technical safeguards: 45 CFR 164.312 mapped to controls
 
 The standard text below is paraphrased from the regulation (Cornell LII copy of
@@ -65,7 +95,10 @@ why not and what you did instead.
 The software cannot do these for you; the repo ships templates so a small
 clinic or MSP can start from something:
 
-* Risk analysis and risk management (164.308(a)(1)): `docs/compliance/risk-analysis-template.md` (roadmap).
+* Risk analysis and risk management (164.308(a)(1)):
+  [`docs/compliance/risk-analysis-template.md`](risk-analysis-template.md),
+  a worksheet with the asset inventory, threat and risk tables, the control
+  mapping to 164.308 and 164.312 and a review schedule.
 * Information system activity review: `aiit-console audit-verify` plus a
   monthly review checklist.
 * Workforce security and sanction policy: who may hold a console key.
@@ -127,7 +160,11 @@ console and an asset inventory export are on the roadmap rather than optional.
    smart card.
 2. `AIIT_KEY_PASSPHRASE` set so private keys are encrypted at rest.
 3. Default provider is `ollama`; `anthropic` only after the BAA is signed and
-   the HIPAA-ready org is provisioned; API key lives in `.env` only.
+   the HIPAA-ready org is provisioned; API key lives in the console's `.env`
+   only (`<console dir>/.env` or `AIIT_ENV_FILE`, never the working
+   directory). Set `AIIT_HIPAA_MODE=1` so no beta feature is used, and (from
+   PR 2) `AIIT_ALLOW_HOSTED=1` as the explicit, audited decision that data
+   may leave the machine.
 4. Retention: decide how long case folders stay; the default is forever, so
    schedule deletion. Audit logs are typically kept six years (secondary
    sources cite this period; confirm with counsel).
