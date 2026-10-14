@@ -1,0 +1,96 @@
+name: Bug report
+description: Something in aiit-agent or aiit-console does not behave as documented.
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please read `SUPPORT.md` first: it lists what we need and, more importantly, what must never be pasted here. Diagnostic bundles can contain protected health information. Describe the shape of the data instead of attaching it.
+
+  - type: dropdown
+    id: side
+    attributes:
+      label: Which side
+      description: Where did the problem happen?
+      options:
+        - aiit-agent (endpoint)
+        - aiit-console (operator machine)
+        - both / the hand-off between them
+        - not sure
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system, edition and build
+      description: For example "Windows 11 Pro 23H2 (22631.3737)", "macOS 14.5", "Ubuntu 24.04.1". Leave out the hostname.
+      placeholder: Windows 11 Pro 23H2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - pip install from a wheel (offline)
+        - pip install -e . (checkout)
+        - pip install aiit (PyPI)
+        - single-file binary (PyInstaller)
+        - other (say which below)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: aiit version
+      description: Output of `aiit-console --version` or `pip show aiit`, plus the Python version.
+      placeholder: aiit-console 0.1.0, Python 3.12.4
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command that was run
+      description: The exact command line, with paths, case ids and hostnames replaced by placeholders such as `<case>` or `E:\bundle.aiit`.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What the documentation or the help text led you to expect.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead. Include the error line printed by the tool and, if you re-ran with `--debug`, the traceback. Remove any path segment that contains a username.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Provider and model name (never the API key), policy mode, whether TLS was in use, whether this worked in an earlier version.
+
+  - type: checkboxes
+    id: no_phi
+    attributes:
+      label: Data hygiene
+      description: Bundles, logs and identifiers must stay off this tracker. See `SUPPORT.md`.
+      options:
+        - label: I did not attach a bundle, log, hostname, username or patient data
+          required: true
+        - label: I searched existing issues and this is not a duplicate
+          required: false

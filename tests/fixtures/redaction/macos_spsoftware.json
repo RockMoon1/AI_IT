@@ -1,0 +1,63 @@
+{
+  "SPSoftwareDataType" : [
+    {
+      "_name" : "os_overview",
+      "boot_mode" : "normal_boot",
+      "boot_volume" : "Macintosh HD",
+      "kernel_version" : "Darwin 23.6.0",
+      "local_host_name" : "Janes-MacBook-Pro",
+      "os_version" : "macOS 14.6.1 (23G93)",
+      "secure_vm" : "secure_vm_enabled",
+      "system_integrity" : "integrity_enabled",
+      "uptime" : "up 3:02:14:33",
+      "user_name" : "Jane Smith (jsmith)"
+    }
+  ],
+  "SPHardwareDataType" : [
+    {
+      "_name" : "hardware_overview",
+      "activation_lock_status" : "activation_lock_disabled",
+      "boot_rom_version" : "10151.140.19",
+      "chip_type" : "Apple M2",
+      "machine_model" : "Mac14,2",
+      "machine_name" : "MacBook Air",
+      "model_number" : "MLXW3LL/A",
+      "number_processors" : "proc 8:4:4",
+      "os_loader_version" : "10151.140.19",
+      "physical_memory" : "16 GB",
+      "platform_UUID" : "6F1A2B3C-4D5E-6F70-8192-A3B4C5D6E7F8",
+      "provisioning_UDID" : "00008112-000A1B2C3D4E5F67",
+      "serial_number" : "C02ZX1ABCD12"
+    }
+  ],
+  "SPNetworkDataType" : [
+    {
+      "_name" : "Wi-Fi",
+      "Ethernet" : {
+        "MAC Address" : "a4:b5:c6:d7:e8:f9",
+        "MediaOptions" : [],
+        "MediaSubType" : "Auto Select"
+      },
+      "IPv4" : {
+        "Addresses" : ["192.168.10.88"],
+        "Router" : "192.168.10.1"
+      },
+      "IPv6" : {
+        "Addresses" : ["2600:1f18:1234:5678:1c2d:3e4f:5a6b:7c8d", "fe80::1c2d:3e4f:5a6b:7c8d"],
+        "ConfigMethod" : "Automatic"
+      },
+      "dns" : {
+        "SearchDomains" : ["clinic.local"],
+        "ServerAddresses" : ["192.168.10.1", "2606:4700:4700::1111"]
+      },
+      "interface" : "en0",
+      "type" : "AirPort"
+    }
+  ],
+  "AiitExtra" : {
+    "home" : "/Users/jsmith/Library/Logs",
+    "shared" : "/Users/Shared/clinic",
+    "keychain_note" : "Keychain item SMB password for smb://jsmith:Summer2024!@clinic-fs-01/home",
+    "other_guid" : "2A1B3C4D-5E6F-7081-92A3-B4C5D6E7F8A9"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "must_not_survive": [
+    "jsmith",
+    "Tr0ub4dor-3",
+    "admin:hunter22",
+    "hunter22",
+    "tok-EXAMPLE-0000000000000000",
+    "eyJhbGciOiJub25lIn0.eyJzdWIiOiJqc21pdGgifQ.ZmFrZS1zaWduYXR1cmUtMDAwMA",
+    "AIzaEXAMPLE000000000000000000000000000",
+    "AKIAEXAMPLE000000000",
+    "EXAMPLE0000000000000000000000000000000000",
+    "clinic.local"
+  ],
+  "must_survive": [
+    "/usr/lib/postgresql/14/bin/postgres",
+    "/etc/postgresql/14/main/postgresql.conf",
+    "nginx: worker process",
+    "/usr/lib/firefox/firefox --profile /home/",
+    "ab12cd34.default-release",
+    "/opt/clinic/app.jar",
+    "--auth-header \"Bearer <SECRET_REDACTED>\"",
+    "https://api.example.net/v1",
+    "aws s3 ls --profile clinic",
+    "ssh -p 2222",
+    "[kthreadd]",
+    "postgres://<SECRET_REDACTED>@db.",
+    "ps aux"
+  ],
+  "secrets": [
+    "Tr0ub4dor-3",
+    "hunter22",
+    "admin:hunter22",
+    "tok-EXAMPLE-0000000000000000",
+    "eyJhbGciOiJub25lIn0.eyJzdWIiOiJqc21pdGgifQ.ZmFrZS1zaWduYXR1cmUtMDAwMA",
+    "AIzaEXAMPLE000000000000000000000000000",
+    "AKIAEXAMPLE000000000",
+    "EXAMPLE0000000000000000000000000000000000"
+  ],
+  "config": {"redact_hostnames": ["clinic.local"], "extra_literals": ["jsmith"]}
+}

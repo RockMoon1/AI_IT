@@ -1,7 +1,9 @@
 """LLM provider registry. Providers return a dict matching the FixPlanDraft schema."""
 from __future__ import annotations
 
-from .base import LLMProvider, ProviderError, ProviderRefusal
+from .base import LLMProvider, ProviderError, ProviderOutputError, ProviderRefusal, parse_json_text
+
+PROVIDER_NAMES = ("dryrun", "ollama", "anthropic")
 
 
 def get_provider(name: str, **opts) -> LLMProvider:
@@ -15,7 +17,7 @@ def get_provider(name: str, **opts) -> LLMProvider:
     if name == "anthropic":
         from .anthropic_provider import AnthropicProvider
         return AnthropicProvider(**opts)
-    raise ProviderError(f"unknown provider {name!r}; use dryrun, ollama or anthropic")
+    raise ProviderError(f"unknown provider {name!r}; use one of {', '.join(PROVIDER_NAMES)}")
 
 
-__all__ = ["get_provider", "LLMProvider", "ProviderError", "ProviderRefusal"]
+__all__ = ["get_provider", "LLMProvider", "ProviderError", "ProviderOutputError", "ProviderRefusal", "parse_json_text", "PROVIDER_NAMES"]

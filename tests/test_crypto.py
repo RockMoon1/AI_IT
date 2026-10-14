@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from . import helpers  # noqa: F401
 from aiit.common.crypto import CryptoError, Identity, open_sealed, seal, sign_object, verify_object
 
 

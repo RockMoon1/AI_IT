@@ -19,6 +19,8 @@ description = "Documentation placeholders"
 paths = [
   '''\.env\.example$''',
   '''docs/.*\.md$''',
+  '''tests/test_redact\.py$''',
+  '''tests/fixtures/redaction/.*''',
 ]
 regexes = [
   '''sk-ant-\.\.\.''',

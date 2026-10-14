@@ -1,18 +1,42 @@
 """Pydantic models for everything that crosses a trust boundary."""
 from __future__ import annotations
 
-from typing import Any, Literal
+from pathlib import PurePosixPath, PureWindowsPath
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
+
+from .util import ID_RE
 
 OSName = Literal["windows", "linux", "macos", "any"]
 Risk = Literal["read_only", "low", "medium", "high"]
 RISK_ORDER: dict[str, int] = {"read_only": 0, "low": 1, "medium": 2, "high": 3}
 
+# Ids minted by util.new_id look like "case-3f9a1c2b7d4e". Anything else that
+# arrives in a header, manifest or plan is rejected before it can touch a path.
+IdStr = Annotated[str, StringConstraints(pattern=ID_RE.pattern)]
+MAX_COMMAND_CHARS = 4096
+
+
+def validate_relative_path(value: str) -> str:
+    """Bundle member paths: relative, forward slashes, no drive, no '..', no control chars."""
+    if not value or len(value) > 512 or "\x00" in value:
+        raise ValueError("empty, too long or contains NUL")
+    if "\\" in value:
+        raise ValueError("backslashes are not allowed in bundle paths")
+    if PureWindowsPath(value).drive or PurePosixPath(value).is_absolute() or value.startswith("/"):
+        raise ValueError("absolute paths are not allowed in bundle paths")
+    parts = PurePosixPath(value).parts
+    if any(part in ("..", ".") for part in parts):
+        raise ValueError("'.' and '..' are not allowed in bundle paths")
+    if any(ord(ch) < 32 for ch in value):
+        raise ValueError("control characters are not allowed in bundle paths")
+    return value
+
 
 class FileEntry(BaseModel):
     path: str
-    sha256: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     size: int
     collector: str
     command: str = ""
@@ -20,21 +44,27 @@ class FileEntry(BaseModel):
     duration_ms: int = 0
     error: str | None = None
 
+    @field_validator("path")
+    @classmethod
+    def _safe_path(cls, v: str) -> str:
+        return validate_relative_path(v)
+
 
 class BundleManifest(BaseModel):
     version: int = 1
     kind: Literal["diagnostics", "execution_report"] = "diagnostics"
-    bundle_id: str
-    agent_id: str
-    hostname: str
+    bundle_id: IdStr
+    agent_id: IdStr
+    hostname: str = Field(max_length=253)
     platform: OSName
-    os_version: str
+    os_version: str = Field(max_length=512)
     collected_at: str
-    aiit_version: str
-    issue_description: str = ""
-    case_id: str | None = None
-    plan_id: str | None = None
-    files: list[FileEntry] = Field(default_factory=list)
+    aiit_version: str = Field(max_length=32)
+    issue_description: str = Field(default="", max_length=20_000)
+    case_id: IdStr | None = None
+    plan_id: IdStr | None = None
+    files: list[FileEntry] = Field(default_factory=list, max_length=2000)
+    audit_head: dict[str, Any] | None = None
 
 
 class PlanStep(BaseModel):
@@ -45,7 +75,7 @@ class PlanStep(BaseModel):
         description="'command' runs on the endpoint via the OS shell; 'manual' is an instruction for the human"
     )
     os: OSName = "any"
-    command: str | None = Field(default=None, description="Single non-interactive command line; required when action=command")
+    command: str | None = Field(default=None, max_length=MAX_COMMAND_CHARS, description="Single non-interactive command line; required when action=command")
     risk: Risk = Field(description="read_only: changes nothing; low: safe service restarts/cache clears; medium: config changes; high: data or boot affecting")
     requires_reboot: bool = False
     expected_outcome: str = ""
@@ -54,8 +84,11 @@ class PlanStep(BaseModel):
 
     @model_validator(mode="after")
     def _cmd_required(self) -> "PlanStep":
-        if self.action == "command" and not (self.command and self.command.strip()):
-            raise ValueError("command is required when action is 'command'")
+        if self.action == "command":
+            if not (self.command and self.command.strip()):
+                raise ValueError("command is required when action is 'command'")
+            if "\n" in self.command or "\r" in self.command or "\x00" in self.command:
+                raise ValueError("command must be a single line without control characters")
         return self
 
 
@@ -72,9 +105,9 @@ class FixPlanDraft(BaseModel):
 
 
 class FixPlan(FixPlanDraft):
-    plan_id: str
-    case_id: str
-    target_agent_id: str
+    plan_id: IdStr
+    case_id: IdStr
+    target_agent_id: IdStr
     target_os: OSName
     created_at: str
     expires_at: str
@@ -85,7 +118,7 @@ class FixPlan(FixPlanDraft):
 
 class SignedPlan(BaseModel):
     plan: FixPlan
-    signer_id: str
+    signer_id: IdStr
     signer_pub: str
     approved_by: str
     approved_at: str
@@ -106,25 +139,26 @@ class StepResult(BaseModel):
 
 
 class ExecutionReport(BaseModel):
-    plan_id: str
-    case_id: str
-    agent_id: str
-    hostname: str
+    plan_id: IdStr
+    case_id: IdStr
+    agent_id: IdStr
+    hostname: str = Field(max_length=253)
     platform: OSName
     started_at: str
     ended_at: str
     mode: Literal["dry_run", "enforce"]
     policy_version: str
     results: list[StepResult]
+    audit_head: dict[str, Any] | None = None
 
 
 class Enrollment(BaseModel):
     """Public information an endpoint needs to trust a console. Safe to copy anywhere."""
 
     version: int = 1
-    console_id: str
-    console_sign_pub: str
-    console_box_pub: str
+    console_id: IdStr
+    console_sign_pub: str = Field(pattern=r"^[0-9a-f]{64}$")
+    console_box_pub: str = Field(pattern=r"^[0-9a-f]{64}$")
     created_at: str
     label: str = ""
 

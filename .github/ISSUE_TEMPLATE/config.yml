@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/RockMoon1/AI_IT/security/advisories/new
+    about: Exploitable bugs go through a private security advisory, never a public issue. See SECURITY.md.
+  - name: Questions and discussion
+    url: https://github.com/RockMoon1/AI_IT/discussions
+    about: How-to questions, design ideas and field reports (once Discussions are enabled; otherwise open an issue with the question label).

@@ -1,0 +1,33 @@
+{
+  "must_not_survive": [
+    "CLINIC-PC-07",
+    "clinic.local",
+    "00-1A-2B-3C-4D-5E",
+    "A4-B5-C6-D7-E8-F9",
+    "00-15-5D-01-02-03",
+    "2600:1f18:1234:5678:a1b2:c3d4:e5f6:7890",
+    "2600:1f18:1234:5678:9f8e:7d6c:5b4a:3928",
+    "2606:4700:4700::1111",
+    "11.0.113.53"
+  ],
+  "must_survive": [
+    "Windows IP Configuration",
+    "Intel(R) Ethernet Connection (17) I219-LM",
+    "Intel(R) Wi-Fi 6 AX201 160MHz",
+    "Hyper-V Virtual Ethernet Adapter",
+    "fe80::a1b2:c3d4:e5f6:7890%12(Preferred)",
+    "fe80::1%12",
+    "192.168.10.57(Preferred)",
+    "192.168.10.1",
+    "172.29.0.1",
+    "255.255.255.0",
+    "255.255.240.0",
+    "Monday, October 13, 2026 7:41:30 AM",
+    "100671019",
+    "Node Type . . . . . . . . . . . . : Hybrid",
+    "Media disconnected",
+    "NetBIOS over Tcpip. . . . . . . . : Enabled"
+  ],
+  "secrets": [],
+  "config": {}
+}

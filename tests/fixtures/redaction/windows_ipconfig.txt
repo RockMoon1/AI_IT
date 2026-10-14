@@ -1,0 +1,52 @@
+
+Windows IP Configuration
+
+   Host Name . . . . . . . . . . . . : CLINIC-PC-07
+   Primary Dns Suffix  . . . . . . . : clinic.local
+   Node Type . . . . . . . . . . . . : Hybrid
+   IP Routing Enabled. . . . . . . . : No
+   WINS Proxy Enabled. . . . . . . . : No
+   DNS Suffix Search List. . . . . . : clinic.local
+
+Ethernet adapter Ethernet:
+
+   Connection-specific DNS Suffix  . : clinic.local
+   Description . . . . . . . . . . . : Intel(R) Ethernet Connection (17) I219-LM
+   Physical Address. . . . . . . . . : 00-1A-2B-3C-4D-5E
+   DHCP Enabled. . . . . . . . . . . : Yes
+   Autoconfiguration Enabled . . . . : Yes
+   IPv6 Address. . . . . . . . . . . : 2600:1f18:1234:5678:a1b2:c3d4:e5f6:7890(Preferred)
+   Temporary IPv6 Address. . . . . . : 2600:1f18:1234:5678:9f8e:7d6c:5b4a:3928(Preferred)
+   Link-local IPv6 Address . . . . . : fe80::a1b2:c3d4:e5f6:7890%12(Preferred)
+   IPv4 Address. . . . . . . . . . . : 192.168.10.57(Preferred)
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Lease Obtained. . . . . . . . . . : Monday, October 13, 2026 7:41:30 AM
+   Lease Expires . . . . . . . . . . : Tuesday, October 14, 2026 7:41:30 AM
+   Default Gateway . . . . . . . . . : fe80::1%12
+                                       192.168.10.1
+   DHCP Server . . . . . . . . . . . : 192.168.10.1
+   DHCPv6 IAID . . . . . . . . . . . : 100671019
+   DHCPv6 Client DUID. . . . . . . . : 00-01-00-01-2A-3B-4C-5D-00-1A-2B-3C-4D-5E
+   DNS Servers . . . . . . . . . . . : 2606:4700:4700::1111
+                                       192.168.10.1
+                                       11.0.113.53
+   NetBIOS over Tcpip. . . . . . . . : Enabled
+
+Wireless LAN adapter Wi-Fi:
+
+   Media State . . . . . . . . . . . : Media disconnected
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Intel(R) Wi-Fi 6 AX201 160MHz
+   Physical Address. . . . . . . . . : A4-B5-C6-D7-E8-F9
+   DHCP Enabled. . . . . . . . . . . : Yes
+   Autoconfiguration Enabled . . . . : Yes
+
+Ethernet adapter vEthernet (WSL):
+
+   Connection-specific DNS Suffix  . : 
+   Description . . . . . . . . . . . : Hyper-V Virtual Ethernet Adapter
+   Physical Address. . . . . . . . . : 00-15-5D-01-02-03
+   Link-local IPv6 Address . . . . . : fe80::5efe:172.29.0.1%31(Preferred)
+   IPv4 Address. . . . . . . . . . . : 172.29.0.1(Preferred)
+   Subnet Mask . . . . . . . . . . . : 255.255.240.0
+   Default Gateway . . . . . . . . . : 

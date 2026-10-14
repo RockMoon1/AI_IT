@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 from ..common.audit import AuditLog
 from ..common.crypto import Identity
 from ..common.policy import Policy
 from ..common.schema import Enrollment
-from ..common.util import ensure_private_dir, new_id, read_json, write_json
+from ..common.util import ensure_private_dir, iso, new_id, read_json, write_json
 
 
 def default_agent_dir() -> Path:
@@ -28,16 +29,22 @@ class AgentState:
         self.console_file = self.root / "console-enrollment.json"
         self.policy_file = self.root / "policy.json"
         self.applied_file = self.root / "applied_plans.json"
+        self.applying_file = self.root / "applying.json"
         self.inbox = self.root / "inbox"
         self.outbox = self.root / "outbox"
+        self.sent = self.outbox / "sent"
         self.audit = AuditLog(self.root / "audit.jsonl", actor_id=self.agent_id_or_none() or "unenrolled")
 
-    # -- identity
+    # -- identity -----------------------------------------------------------
     def agent_id_or_none(self) -> str | None:
         meta = self.keys_dir / "identity.json"
         if meta.exists():
             return read_json(meta).get("id")
         return None
+
+    def public_sign_key(self) -> str | None:
+        meta = self.keys_dir / "identity.json"
+        return read_json(meta).get("sign_pub") if meta.exists() else None
 
     def is_enrolled(self) -> bool:
         return (self.keys_dir / "identity.json").exists() and self.console_file.exists()
@@ -65,6 +72,7 @@ class AgentState:
             Policy().save(self.policy_file)
         return Policy.load(self.policy_file)
 
+    # -- plan bookkeeping ---------------------------------------------------
     def applied_plan_ids(self) -> list[str]:
         if not self.applied_file.exists():
             return []
@@ -75,3 +83,19 @@ class AgentState:
         if plan_id not in ids:
             ids.append(plan_id)
         write_json(self.applied_file, ids, private=True)
+
+    def applying(self) -> dict[str, Any] | None:
+        """Write-ahead marker of an enforce run in progress (survives a crash mid-plan)."""
+        if not self.applying_file.exists():
+            return None
+        try:
+            return read_json(self.applying_file)
+        except Exception:
+            return None
+
+    def mark_applying(self, plan_id: str, completed_step_ids: list[str], current_step_id: str | None) -> None:
+        write_json(self.applying_file, {"plan_id": plan_id, "completed": list(completed_step_ids), "current": current_step_id,
+                                        "updated_at": iso()}, private=True)
+
+    def clear_applying(self) -> None:
+        self.applying_file.unlink(missing_ok=True)

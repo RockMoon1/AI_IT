@@ -4,11 +4,10 @@ import os
 import tempfile
 import threading
 import unittest
+import unittest.mock as mock
 import urllib.request
 from pathlib import Path
-from unittest import mock
 
-from . import helpers
 from aiit.agent import cli as agent_cli
 from aiit.agent import collectors
 from aiit.agent.collectors import Collector, collect_all
@@ -23,7 +22,7 @@ TOKEN = "unit-test-token-0123456789abcdef"
 
 def fake_collectors(os_name: str) -> list[Collector]:
     return [
-        Collector("echo_ok", "sys", ["powershell.exe", "-NoProfile", "-Command", "Write-Output 'svc ok user@example.org 11.22.33.44'"] if os.name == "nt" else ["sh", "-c", "echo 'svc ok user@example.org 11.22.33.44'"], "txt", 20),
+        Collector("echo_ok", "sys", ["powershell.exe", "-NoProfile", "-Command", "Write-Output 'svc ok user@example.org 11.22.33.44'"] if os.name == "nt" else ["sh", "-c", "echo 'svc ok user@example.org 11.22.33.44'"], "txt", 120),  # PowerShell cold start on a loaded runner is slow
         Collector("missing_tool", "logs", ["definitely-not-a-real-command-xyz"], "txt", 5),
     ]
 

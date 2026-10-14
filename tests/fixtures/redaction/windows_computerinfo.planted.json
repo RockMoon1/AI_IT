@@ -1,0 +1,37 @@
+{
+  "must_not_survive": [
+    "jsmith",
+    "Jane Smith",
+    "Example Clinic",
+    "CLINIC-PC-07",
+    "CLINIC-DC-01",
+    "clinic-fs-01",
+    "clinic.local",
+    "7XY2ZQ3",
+    "00330-80000-00000-AA123",
+    "00330-80000-00000-AAOEM",
+    "S-1-5-21-3623811015-3361044348-30300820-1013",
+    "2600:1f18:1234:5678:a1b2:c3d4:e5f6:7890",
+    "11.0.113.53"
+  ],
+  "must_survive": [
+    "Dell Inc.",
+    "OptiPlex 7090",
+    "Windows 10 Pro",
+    "10.0.19045",
+    "11th Gen Intel(R) Core(TM) i5-11500 @ 2.70GHz",
+    "C:\\\\Users\\\\Public\\\\Documents",
+    "C:\\\\WINDOWS\\\\system32",
+    "S-1-5-32-544",
+    "NT AUTHORITY\\\\SYSTEM",
+    "NT SERVICE\\\\MSSQLSERVER",
+    "fe80::a1b2:c3d4:e5f6:7890%12",
+    "192.168.10.57",
+    "192.168.10.1",
+    "line one\\nline two",
+    "MemberWorkstation",
+    "2026-10-13T07:41:12"
+  ],
+  "secrets": [],
+  "config": {}
+}

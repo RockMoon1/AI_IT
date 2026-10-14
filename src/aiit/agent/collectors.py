@@ -6,18 +6,19 @@ are recorded in the manifest, never fatal. Nothing here changes the system.
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import platform
 import shutil
 import string
-import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from ..common.schema import FileEntry
 from ..common.util import current_os, sha256_file
+from .procs import powershell_exe, run_capped, windows_system32
 
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024  # per file
 
@@ -34,19 +35,78 @@ class Collector:
 
 
 def _ps(script: str) -> list[str]:
-    return ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+    return [powershell_exe(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]
+
+
+def windows_system32_argv(exe: str, *args: str) -> list[str]:
+    """Build an argv whose program is an absolute path under System32.
+
+    Starting Windows binaries by bare name lets CreateProcess search the
+    current directory first, which is dangerous when apply runs from removable
+    media. Resolving to System32 removes that search.
+    """
+    return [windows_system32(exe), *args]
+
+
+_PS_NAMES = ("powershell", "powershell.exe")
+_PS_FLAGS = ("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass")
+_PS_SCRIPT_SWITCHES = ("-command", "-c", "-file", "-f", "-encodedcommand", "-e", "-ec")
+
+
+def resolve_windows_argv(argv: list[str], exists=os.path.exists) -> list[str]:
+    """Return ``argv`` with a bare Windows program name made absolute.
+
+    A bare ``powershell``/``powershell.exe`` becomes the absolute Windows
+    PowerShell under System32 with the same switches ``_ps`` uses
+    (``-NoProfile -NonInteractive -ExecutionPolicy Bypass``, deduplicated,
+    ahead of the caller's ``-Command``/``-File``): on Windows a PowerShell
+    started without those switches has been seen to take 20 s or more to exit
+    on otherwise idle hosts, while the ``_ps`` form returns in well under a
+    second. Any other bare name that exists under System32 is started from
+    there. Names that carry a directory component are left alone, as are
+    bare names with no System32 counterpart (``run_one`` still looks those up
+    on PATH).
+    """
+    if not argv:
+        return argv
+    prog = argv[0]
+    if ntpath.basename(prog) != prog or not prog:
+        return argv
+    if prog.lower() in _PS_NAMES:
+        rest = list(argv[1:])
+        kept: list[str] = []
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            low = tok.lower()
+            if low in _PS_SCRIPT_SWITCHES:
+                kept.extend(rest[i:])
+                break
+            if low == "-executionpolicy":
+                i += 2  # drop the switch and its value; Bypass is re-added
+                continue
+            if low in ("-noprofile", "-noninteractive"):
+                i += 1
+                continue
+            kept.append(tok)
+            i += 1
+        return [powershell_exe(), *_PS_FLAGS, *kept]
+    candidate = windows_system32(prog if ntpath.splitext(prog)[1] else prog + ".exe")
+    if exists(candidate):
+        return [candidate, *argv[1:]]
+    return argv
 
 
 WINDOWS: list[Collector] = [
     Collector("computerinfo", "sys", _ps("Get-ComputerInfo | ConvertTo-Json -Depth 2"), "json", 90),
-    Collector("systeminfo", "sys", ["systeminfo"], "txt", 90),
+    Collector("systeminfo", "sys", windows_system32_argv("systeminfo.exe"), "txt", 90),
     Collector("uptime_boot", "sys", _ps("Get-CimInstance Win32_OperatingSystem | Select LastBootUpTime,LocalDateTime,FreePhysicalMemory,TotalVisibleMemorySize | ConvertTo-Json"), "json", 30),
     Collector("hotfixes", "sys", _ps("Get-HotFix | Sort InstalledOn -Desc | Select HotFixID,Description,InstalledOn | ConvertTo-Json"), "json", 60),
     Collector("services", "sys", _ps("Get-Service | Select Name,DisplayName,Status,StartType | ConvertTo-Json"), "json", 60),
     Collector("services_stopped_auto", "sys", _ps("Get-CimInstance Win32_Service | Where {$_.StartMode -eq 'Auto' -and $_.State -ne 'Running'} | Select Name,DisplayName,State,StartMode,ExitCode | ConvertTo-Json"), "json", 60),
     Collector("processes_top", "sys", _ps("Get-Process | Sort CPU -Desc | Select -First 60 Name,Id,CPU,WS,Path | ConvertTo-Json"), "json", 60),
     Collector("pnp_errors", "sys", _ps("Get-PnpDevice | Where Status -ne 'OK' | Select FriendlyName,Status,Class,InstanceId | ConvertTo-Json"), "json", 60),
-    Collector("drivers", "sys", ["driverquery", "/v"], "txt", 90, quick=False),
+    Collector("drivers", "sys", windows_system32_argv("driverquery.exe", "/v"), "txt", 90, quick=False),
     Collector("volumes", "sys", _ps("Get-Volume | Select DriveLetter,FileSystemLabel,FileSystem,HealthStatus,SizeRemaining,Size | ConvertTo-Json"), "json", 60),
     Collector("disks", "sys", _ps("Get-PhysicalDisk | Select FriendlyName,MediaType,HealthStatus,OperationalStatus,Size | ConvertTo-Json"), "json", 60),
     Collector("startup", "sys", _ps("Get-CimInstance Win32_StartupCommand | Select Name,Command,Location,User | ConvertTo-Json"), "json", 60, quick=False),
@@ -54,15 +114,15 @@ WINDOWS: list[Collector] = [
     Collector("defender", "sys", _ps("Get-MpComputerStatus | Select AMServiceEnabled,AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,QuickScanEndTime | ConvertTo-Json"), "json", 60),
     Collector("bitlocker", "sys", _ps("Get-BitLockerVolume | Select MountPoint,ProtectionStatus,EncryptionPercentage,VolumeStatus | ConvertTo-Json"), "json", 60),
     Collector("local_users", "sys", _ps("Get-LocalUser | Select Name,Enabled,LastLogon,PasswordExpires | ConvertTo-Json"), "json", 60),
-    Collector("power", "sys", ["powercfg", "/l"], "txt", 30, quick=False),
+    Collector("power", "sys", windows_system32_argv("powercfg.exe", "/l"), "txt", 30, quick=False),
     Collector("printers", "sys", _ps("Get-Printer | Select Name,DriverName,PortName,PrinterStatus,Shared | ConvertTo-Json"), "json", 60, quick=False),
     Collector("scheduled_tasks", "sys", _ps("Get-ScheduledTask | Where {$_.State -ne 'Disabled' -and $_.TaskPath -notlike '\\Microsoft\\*'} | Select TaskName,TaskPath,State | ConvertTo-Json"), "json", 60, quick=False),
-    Collector("ipconfig", "net", ["ipconfig", "/all"], "txt", 30),
+    Collector("ipconfig", "net", windows_system32_argv("ipconfig.exe", "/all"), "txt", 30),
     Collector("adapters", "net", _ps("Get-NetAdapter | Select Name,InterfaceDescription,Status,LinkSpeed,MacAddress,DriverVersion | ConvertTo-Json"), "json", 60),
-    Collector("routes", "net", ["route", "print"], "txt", 30),
+    Collector("routes", "net", windows_system32_argv("route.exe", "print"), "txt", 30),
     Collector("dns", "net", _ps("Get-DnsClientServerAddress | Where {$_.ServerAddresses} | Select InterfaceAlias,AddressFamily,ServerAddresses | ConvertTo-Json"), "json", 30),
-    Collector("connections", "net", ["netstat", "-ano"], "txt", 60, quick=False),
-    Collector("proxy", "net", ["netsh", "winhttp", "show", "proxy"], "txt", 30),
+    Collector("connections", "net", windows_system32_argv("netstat.exe", "-ano"), "txt", 60, quick=False),
+    Collector("proxy", "net", windows_system32_argv("netsh.exe", "winhttp", "show", "proxy"), "txt", 30),
     Collector("firewall_profiles", "net", _ps("Get-NetFirewallProfile | Select Name,Enabled,DefaultInboundAction | ConvertTo-Json"), "json", 30),
     Collector("system_errors_7d", "logs", _ps("Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2,3; StartTime=(Get-Date).AddDays(-7)} -MaxEvents 300 -ErrorAction SilentlyContinue | Select TimeCreated,Id,LevelDisplayName,ProviderName,Message | ConvertTo-Json"), "json", 120),
     Collector("application_errors_7d", "logs", _ps("Get-WinEvent -FilterHashtable @{LogName='Application'; Level=1,2,3; StartTime=(Get-Date).AddDays(-7)} -MaxEvents 300 -ErrorAction SilentlyContinue | Select TimeCreated,Id,LevelDisplayName,ProviderName,Message | ConvertTo-Json"), "json", 120),
@@ -154,28 +214,27 @@ def run_one(c: Collector, out_root: Path) -> FileEntry:
     exit_code: int | None = None
     error: str | None = None
     output = b""
+    argv = resolve_windows_argv(c.argv) if os.name == "nt" else c.argv
     try:
-        if shutil.which(c.argv[0]) is None and not Path(c.argv[0]).exists():
-            raise FileNotFoundError(c.argv[0])
-        proc = subprocess.run(
-            c.argv, capture_output=True, timeout=c.timeout, check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
-        )
-        exit_code = proc.returncode
-        output = proc.stdout
-        if proc.stderr:
-            output += b"\n--- stderr ---\n" + proc.stderr
-    except subprocess.TimeoutExpired as e:
-        error = f"timeout after {c.timeout}s"
-        output = (e.stdout or b"") + b"\n[timeout]\n"
+        if shutil.which(argv[0]) is None and not Path(argv[0]).exists():
+            raise FileNotFoundError(argv[0])
+        pr = run_capped(argv, c.timeout, cap=MAX_OUTPUT_BYTES)
+        if pr.timed_out:
+            error = f"timeout after {c.timeout}s"
+            output = pr.stdout.encode("utf-8", "replace") + b"\n[timeout]\n"
+        else:
+            exit_code = pr.exit_code
+            output = pr.stdout.encode("utf-8", "replace")
+            if pr.stderr:
+                output += b"\n--- stderr ---\n" + pr.stderr.encode("utf-8", "replace")
     except FileNotFoundError:
-        error = f"command not found: {c.argv[0]}"
+        error = f"command not found: {argv[0]}"
     except Exception as e:  # pragma: no cover - defensive
         error = f"{type(e).__name__}: {e}"
     size = _write_capped(path, output if output else (error or "").encode("utf-8"))
     return FileEntry(
         path=rel, sha256=sha256_file(path), size=size, collector=c.name,
-        command=" ".join(c.argv)[:300], exit_code=exit_code,
+        command=" ".join(argv)[:300], exit_code=exit_code,
         duration_ms=int((time.time() - started) * 1000), error=error,
     )
 
@@ -208,7 +267,7 @@ def _native_disk_usage(out_root: Path, os_name: str) -> FileEntry:
                     if len(parts) > 2 and parts[2] in ("ext4", "xfs", "btrfs", "apfs", "hfs", "ntfs", "vfat", "exfat", "zfs"):
                         targets.append(parts[1])
         except Exception:
-            pass
+            pass  # no /proc/mounts (macOS) or unreadable: "/" alone is reported
     out = {}
     for t in dict.fromkeys(targets):
         try:
