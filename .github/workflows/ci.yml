@@ -90,8 +90,8 @@ jobs:
         run: python -m bandit -r src -ll -ii -c pyproject.toml
       - name: pip-audit (runtime dependencies only)
         run: |
-          python -m venv /tmp/rt && /tmp/rt/bin/pip install --quiet . && /tmp/rt/bin/pip install --quiet pip-audit
-          /tmp/rt/bin/pip-audit --strict --progress-spinner off
+          python -m venv /tmp/rt && /tmp/rt/bin/pip install --quiet -e . && /tmp/rt/bin/pip install --quiet pip-audit
+          /tmp/rt/bin/pip-audit --strict --skip-editable --progress-spinner off
 
   install-from-wheel:
     name: Install from wheel and run tests against it

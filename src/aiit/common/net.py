@@ -100,7 +100,8 @@ def http_json(
         req = urllib.request.Request(url, data=data, method=method.upper(), headers=hdrs)
         retry_after: float | None = None
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 - scheme checked above
+            # the URL scheme was validated against ALLOWED_SCHEMES at the top of this function
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
                 raw = _read_capped(resp, max_response)
                 if not expect_json:
                     return raw
