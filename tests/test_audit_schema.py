@@ -2,7 +2,6 @@ import unittest
 
 from pydantic import ValidationError
 
-from . import helpers  # noqa: F401
 from aiit.common.schema import FixPlanDraft, PlanStep, plan_json_schema
 
 

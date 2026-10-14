@@ -89,9 +89,15 @@ jobs:
       - name: bandit
         run: python -m bandit -r src -ll -ii -c pyproject.toml
       - name: pip-audit (runtime dependencies only)
+        # Audit exactly the closure a fresh `pip install aiit` pulls in. The
+        # package itself is not on PyPI, so it is frozen out of the list
+        # (pip-audit --strict turns every skipped package into a failure).
         run: |
-          python -m venv /tmp/rt && /tmp/rt/bin/pip install --quiet -e . && /tmp/rt/bin/pip install --quiet pip-audit
-          /tmp/rt/bin/pip-audit --strict --skip-editable --progress-spinner off
+          python -m venv /tmp/rt && /tmp/rt/bin/pip install --quiet .
+          /tmp/rt/bin/pip freeze --exclude-editable | grep -v -i '^aiit[ =@]' > /tmp/runtime-reqs.txt
+          cat /tmp/runtime-reqs.txt
+          /tmp/rt/bin/pip install --quiet pip-audit
+          /tmp/rt/bin/pip-audit --strict --no-deps --progress-spinner off -r /tmp/runtime-reqs.txt
 
   install-from-wheel:
     name: Install from wheel and run tests against it

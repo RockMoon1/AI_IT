@@ -12,12 +12,19 @@ On Windows, built in binaries are started by absolute ``System32`` paths through
 the current directory first. The documented flow runs
 ``aiit-agent apply E:\\plan.signed.json`` from removable media, and a planted
 ``powershell.exe`` next to the plan must never win.
+
+Text exchanged with a child's console streams goes through ``console_codec``:
+UTF-8 everywhere except Windows, where ``powershell.exe`` and the native console
+tools read stdin and write a redirected stdout in the OEM code page.
 """
 from __future__ import annotations
 
+import codecs
+import ntpath
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -31,11 +38,19 @@ _KEEP_ENV = (
     "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "PATH",
 )
 
-_WINDOWS_PATH = (
-    r"%SystemRoot%\System32;%SystemRoot%;"
-    r"%SystemRoot%\System32\WindowsPowerShell\v1.0;%SystemRoot%\System32\Wbem"
+# Directories, relative to SystemRoot, that make up the fixed Windows child
+# PATH (in search order). ``CreateProcess`` hands an environment block to the
+# child verbatim and never expands ``%VAR%`` references, so the absolute value
+# is built at call time by ``windows_path``.
+_WINDOWS_PATH_SUBDIRS = (
+    "System32",
+    "",
+    r"System32\WindowsPowerShell\v1.0",
+    r"System32\Wbem",
 )
 _POSIX_PATH = "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin"
+
+_DEFAULT_WINDOWS_ROOT = r"C:\Windows"
 
 
 @dataclass
@@ -53,20 +68,74 @@ class ProcResult:
     duration_ms: int
 
 
+def windows_root() -> str:
+    """Return ``%SystemRoot%``, falling back to ``C:\\Windows`` when unset."""
+    return os.environ.get("SystemRoot") or _DEFAULT_WINDOWS_ROOT
+
+
 def windows_system32(name: str) -> str:
     """Return the absolute path to ``name`` under ``%SystemRoot%\\System32``.
 
     ``name`` may contain sub directories (for example the relative path to
     ``powershell.exe``). ``SystemRoot`` falls back to ``C:\\Windows`` when it is
-    not set in the environment.
+    not set in the environment. Windows path rules are used regardless of the
+    host so the result is the same string on every platform.
     """
-    root = os.environ.get("SystemRoot") or r"C:\Windows"
-    return os.path.join(root, "System32", name)
+    return ntpath.join(windows_root(), "System32", name)
 
 
 def powershell_exe() -> str:
     """Return the absolute path to Windows PowerShell under System32."""
-    return windows_system32(os.path.join("WindowsPowerShell", "v1.0", "powershell.exe"))
+    return windows_system32(ntpath.join("WindowsPowerShell", "v1.0", "powershell.exe"))
+
+
+def windows_path() -> str:
+    """Return the fixed, fully expanded PATH given to children on Windows.
+
+    Built from the real ``SystemRoot`` at call time: System32, the Windows
+    directory, the Windows PowerShell directory and Wbem, separated by ``;``.
+    """
+    root = windows_root()
+    return ";".join(ntpath.join(root, sub) if sub else root for sub in _WINDOWS_PATH_SUBDIRS)
+
+
+def child_locale(platform: str | None = None) -> str:
+    """Return the ``LC_ALL`` value pinned into children for ``platform``.
+
+    Only a locale that exists on the platform is used: ``C.UTF-8`` on Linux,
+    ``en_US.UTF-8`` on macOS (which ships no ``C.UTF-8``; forcing one makes
+    every setlocale() user print a warning to stderr) and plain ``C`` elsewhere.
+    ``platform`` defaults to ``sys.platform``.
+    """
+    plat = sys.platform if platform is None else platform
+    if plat.startswith("linux"):
+        return "C.UTF-8"
+    if plat == "darwin":
+        return "en_US.UTF-8"
+    return "C"
+
+
+def console_codec(os_name: str | None = None) -> str:
+    """Return the codec for bytes exchanged with a child's console streams.
+
+    On Windows, ``powershell.exe`` reads stdin through ``[Console]::In`` and
+    writes a redirected stdout with ``[Console]::OutputEncoding``; both default
+    to the OEM code page (cp437, cp850, cp1252, ...), never UTF-8, and native
+    console tools behave the same. The code page is asked from ``GetOEMCP`` at
+    call time and returned as ``cp<N>``; when that is unavailable the ``mbcs``
+    codec (the ANSI code page) is used. On every other platform the answer is
+    ``utf-8``. ``os_name`` defaults to ``os.name``.
+    """
+    if (os.name if os_name is None else os_name) != "nt":
+        return "utf-8"
+    try:
+        import ctypes
+
+        name = f"cp{int(ctypes.windll.kernel32.GetOEMCP())}"
+        codecs.lookup(name)
+        return name
+    except Exception:
+        return "mbcs"
 
 
 def _is_sensitive(name: str) -> bool:
@@ -90,32 +159,34 @@ def scrubbed_env() -> dict[str, str]:
 
     Only a small allow list of variables is copied from the agent's own
     environment, and any of those that look secret bearing are dropped as a
-    defence in depth. PATH is replaced with a fixed system PATH, the current
-    directory is removed from executable search, and the locale is pinned so
-    output is deterministic across machines.
+    defence in depth. PATH is replaced with a fixed system PATH (built from the
+    real ``SystemRoot`` on Windows), the current directory is removed from
+    executable search, and the locale is pinned so output is deterministic
+    across machines.
     """
     env: dict[str, str] = {}
     for name in _KEEP_ENV:
         val = os.environ.get(name)
         if val is not None and not _is_sensitive(name):
             env[name] = val
-    env["PATH"] = _WINDOWS_PATH if os.name == "nt" else _POSIX_PATH
+    env["PATH"] = windows_path() if os.name == "nt" else _POSIX_PATH
     # CreateProcess and the loader must not search the current directory first.
     env["NoDefaultCurrentDirectoryInExePath"] = "1"
     # Pin the locale so numeric and date formatting does not vary by host.
-    env["LC_ALL"] = "C.UTF-8"
+    env["LC_ALL"] = child_locale()
     return env
 
 
-def _read_capped(handle, cap: int) -> str:
+def _read_capped(handle, cap: int, encoding: str = "utf-8") -> str:
     """Read at most ``cap`` bytes back from a spool file, as decoded text.
 
-    When the file held more than ``cap`` bytes a truncation marker is appended
-    so the reader can tell the output was cut.
+    Bytes are decoded with ``encoding`` (undecodable ones become U+FFFD). When
+    the file held more than ``cap`` bytes a truncation marker is appended so
+    the reader can tell the output was cut.
     """
     handle.seek(0)
     data = handle.read(cap + 1)
-    text = data[:cap].decode("utf-8", "replace")
+    text = data[:cap].decode(encoding, "replace")
     if len(data) > cap:
         text += "\n... [truncated by aiit-agent]\n"
     return text
@@ -154,14 +225,16 @@ def run_capped(argv, timeout, stdin_bytes: bytes | None = None,
     """Run ``argv`` with a scrubbed environment and bounded, spooled output.
 
     stdout and stderr are written to temporary files and read back up to ``cap``
-    bytes each, so a runaway command cannot exhaust memory. stdin is
-    ``/dev/null`` unless ``stdin_bytes`` is given, in which case those exact
-    bytes are written and the pipe is closed (used to feed PowerShell the
-    policy evaluated command on stdin). On POSIX the child gets its own session
-    so a timeout kills the whole process group; on Windows the child is started
-    in a new process group with no window and a timeout runs ``taskkill /T /F``.
+    bytes each, decoded with ``console_codec()``, so a runaway command cannot
+    exhaust memory. stdin is ``/dev/null`` unless ``stdin_bytes`` is given, in
+    which case those exact bytes are written and the pipe is closed (used to
+    feed PowerShell the policy evaluated command on stdin; the caller encodes
+    them with ``console_codec()``). On POSIX the child gets its own session so
+    a timeout kills the whole process group; on Windows the child is started in
+    a new process group with no window and a timeout runs ``taskkill /T /F``.
     """
     env = scrubbed_env()
+    codec = console_codec()
     start = time.monotonic()
     out_f = tempfile.TemporaryFile()
     err_f = tempfile.TemporaryFile()
@@ -202,8 +275,8 @@ def run_capped(argv, timeout, stdin_bytes: bytes | None = None,
             except Exception:
                 pass
     exit_code = proc.returncode
-    stdout = _read_capped(out_f, cap)
-    stderr = _read_capped(err_f, cap)
+    stdout = _read_capped(out_f, cap, codec)
+    stderr = _read_capped(err_f, cap, codec)
     out_f.close()
     err_f.close()
     duration_ms = int((time.monotonic() - start) * 1000)

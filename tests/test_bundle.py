@@ -4,8 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from . import helpers  # noqa: F401
-from aiit.common.bundle import pack_dir, read_bundle, read_bundle_header, unpack_to, write_bundle
+from aiit.common.bundle import MAX_MEMBERS, pack_dir, read_bundle, read_bundle_header, unpack_to, write_bundle
 from aiit.common.crypto import CryptoError, Identity
 
 
@@ -69,16 +68,15 @@ class BundleTests(unittest.TestCase):
                 self.assertEqual(sorted(p.name for p in out.rglob("*")), [], label)
 
     def test_rejects_too_many_members_and_bombs(self):
-        import aiit.common.bundle as bundle
         with tempfile.TemporaryDirectory() as d:
-            many = [(f"f{i}.txt", b"x", "file") for i in range(bundle.MAX_MEMBERS + 1)]
+            many = [(f"f{i}.txt", b"x", "file") for i in range(MAX_MEMBERS + 1)]
             with self.assertRaises(CryptoError):
                 unpack_to(self._tar_with(many), Path(d) / "a")
             from unittest import mock
-            with mock.patch.object(bundle, "MAX_MEMBER_BYTES", 10):
+            with mock.patch("aiit.common.bundle.MAX_MEMBER_BYTES", 10):
                 with self.assertRaises(CryptoError):
                     unpack_to(self._tar_with([("big.txt", b"x" * 11, "file")]), Path(d) / "b")
-            with mock.patch.object(bundle, "MAX_TOTAL_BYTES", 15):
+            with mock.patch("aiit.common.bundle.MAX_TOTAL_BYTES", 15):
                 with self.assertRaises(CryptoError):
                     unpack_to(self._tar_with([("a.txt", b"x" * 10, "file"), ("b.txt", b"x" * 10, "file")]), Path(d) / "c")
 

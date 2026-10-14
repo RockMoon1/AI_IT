@@ -14,7 +14,10 @@ Design notes:
   processes serialise, then appends with flush and fsync.
 * ``checkpoint(identity)`` writes a signed ``<path>.head.json`` so that a log
   truncated below the checkpoint, or rewritten with a different entry at the
-  checkpoint seq, is detected even though every line still chains.
+  checkpoint seq, is detected even though every line still chains. The
+  checkpoint's byte offset is only an optimisation for ``check_and_alert``: when
+  it no longer points at the checkpointed entry (``repair_tail`` spliced bytes
+  out before it) the full chain scan decides, authenticated by seq and hash.
 * The log never contains bundle content or command output, only metadata.
   Nothing in this module writes anything but what callers pass as details,
   a few counters and hashes.
@@ -43,6 +46,10 @@ from .util import atomic_write_bytes, canonical_json, file_lock, iso, os_user, p
 
 GENESIS = "0" * 64
 TAIL_WINDOW = 64 * 1024
+# check_and_alert verifies the whole chain while the log is at most this big and only the part after
+# the signed checkpoint once it is larger (a same-length edit before the checkpoint is then only
+# caught by ``audit verify``; see check_and_alert).
+FULL_SCAN_MAX_BYTES = 8 * 1024 * 1024
 EXPORT_COLUMNS = ("seq", "ts", "actor_id", "os_user", "action", "case_id", "plan_id", "details_json", "hash")
 _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 _REQUIRED_STR = ("hash", "prev_hash", "action", "ts", "actor_id")
@@ -255,7 +262,7 @@ class AuditLog:
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if hasattr(os, "O_BINARY"):  # pragma: no cover - Windows
             flags |= os.O_BINARY
-        fd = os.open(self.path, flags, 0o644)
+        fd = os.open(self.path, flags, 0o600)  # lives in the private state dir; never world readable
         with os.fdopen(fd, "ab") as f:
             f.write(data)
             f.flush()
@@ -271,20 +278,36 @@ class AuditLog:
     def checkpoint(self, identity: crypto.Identity) -> dict[str, Any] | None:
         """Write ``<path>.head.json`` signed by ``identity`` for the last good entry. None if the log is empty."""
         with file_lock(self.path):
-            last, offset = self._tail_last_good()
-            if last is None:
-                return None
-            cp: dict[str, Any] = {
-                "seq": last["seq"],
-                "hash": last["hash"],
-                "offset": offset,
-                "ts": iso(),
-                "signer_id": identity.id,
-                "signer_pub": identity.sign_pub_hex,
-            }
-            cp["signature"] = crypto.sign_object(identity, cp)
-            write_json(self.head_path, cp)
-            return cp
+            return self._checkpoint_locked(identity)
+
+    def _checkpoint_locked(self, identity: crypto.Identity) -> dict[str, Any] | None:
+        last, offset = self._tail_last_good()
+        if last is None:
+            return None
+        cp: dict[str, Any] = {
+            "seq": last["seq"],
+            "hash": last["hash"],
+            "offset": offset,
+            "ts": iso(),
+            "signer_id": identity.id,
+            "signer_pub": identity.sign_pub_hex,
+        }
+        cp["signature"] = crypto.sign_object(identity, cp)
+        write_json(self.head_path, cp)
+        return cp
+
+    def _checkpoint_offset(self) -> int | None:
+        """The byte offset stored in ``<path>.head.json`` (unauthenticated; None when absent or unreadable)."""
+        if not self.head_path.exists():
+            return None
+        try:
+            cp = read_json(self.head_path)
+        except (OSError, ValueError):
+            return None
+        offset = cp.get("offset") if isinstance(cp, dict) else None
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            return None
+        return offset
 
     def _load_checkpoint(self, expected_pub: str | None) -> tuple[dict[str, Any] | None, list[Break]]:
         """Read and authenticate the checkpoint. Returns (checkpoint or None, breaks)."""
@@ -356,14 +379,20 @@ class AuditLog:
         return breaks, count
 
     def _verify_from_checkpoint(self, cp: dict[str, Any]) -> tuple[list[Break], int] | None:
-        """Check only the part after an authenticated checkpoint. None means fall back to a full scan."""
+        """Check only the part after an authenticated checkpoint. None means fall back to a full scan.
+
+        The offset is trusted only when it sits at a line boundary right after the entry whose seq and
+        hash the checkpoint names. Anything else (file shorter than the offset, offset inside a line,
+        a different entry there, as after ``repair_tail`` spliced bytes out before it) is not a verdict:
+        the full scan decides and reports truncation or tampering with the right line numbers.
+        """
         offset = cp["offset"]
         try:
             size = self.path.stat().st_size
         except OSError:
             size = 0
         if size < offset or offset == 0:
-            return [Break(0, cp["seq"], f"log shorter than checkpoint (checkpoint seq {cp['seq']})")], 0
+            return None
         line_no = 0
         with open(self.path, "rb") as f:
             remaining = offset
@@ -376,10 +405,10 @@ class AuditLog:
             f.seek(max(0, offset - TAIL_WINDOW))
             buf = f.read(offset - max(0, offset - TAIL_WINDOW))
         if not buf.endswith(b"\n"):
-            return [Break(line_no, cp["seq"], "checkpoint offset is not at a line boundary")], 0
+            return None
         last = _parse_line(buf[buf.rfind(b"\n", 0, len(buf) - 1) + 1:])
         if last is None or last["seq"] != cp["seq"] or last["hash"] != cp["hash"]:
-            return None  # offset does not point at the checkpointed entry: do the full scan and report properly
+            return None
         breaks, count, _, _ = self._chain(self._scan(offset, line_no + 1), cp["hash"], cp["seq"], None)
         return breaks, cp["seq"] + count
 
@@ -518,13 +547,19 @@ class AuditLog:
         return "\n".join(head + body + tail)
 
     # ------------------------------------------------------------- repair
-    def repair_tail(self) -> dict[str, Any]:
+    def repair_tail(self, identity: crypto.Identity | None = None) -> dict[str, Any]:
         """Move unparseable fragments (a torn trailing write) to ``<path>.corrupt`` and record the repair.
 
         The usual case is a torn last line: the file is truncated back to the last good entry. When
         entries were already recorded after the fragment (they chain from the last good entry, so
         the chain is intact once the fragment is gone) the fragment is spliced out with an atomic
         rewrite. Entries that parse are never touched, so tampering cannot be hidden this way.
+
+        A splice that removes bytes before the signed checkpoint's offset leaves that offset stale
+        (the checkpoint's seq and hash stay valid; verification simply falls back to the full scan).
+        With ``identity`` the checkpoint is re-signed for the repaired log right away; without it the
+        result and the ``audit_tail_repaired`` entry carry ``checkpoint_offset_stale: True`` and the
+        next ``checkpoint()`` clears it.
         """
         with file_lock(self.path):
             lines = list(self._scan())
@@ -540,6 +575,8 @@ class AuditLog:
             good = [ln for ln in lines if ln.entry is not None]
             last_good_end = good[-1].end if good else 0
             trailing = all(ln.start >= last_good_end for ln in bad)
+            cp_offset = self._checkpoint_offset()
+            moved = 0 if cp_offset is None else sum(min(ln.end, cp_offset) - ln.start for ln in bad if ln.start < cp_offset)
             if trailing:
                 with open(self.path, "r+b") as f:
                     f.truncate(last_good_end)
@@ -557,17 +594,31 @@ class AuditLog:
                 keep += data[pos:]
                 atomic_write_bytes(self.path, bytes(keep))
                 how = "spliced"
-            entry = self._append_locked("audit_tail_repaired", {
+            details = {
                 "fragment_sha256": sha256_hex(fragment_bytes), "bytes": len(fragment_bytes), "fragments": len(bad),
                 "line_no": bad[0].line_no, "method": how, "corrupt_file": self.corrupt_path.name,
-            })
+            }
+            stale = moved > 0 and identity is None
+            if moved > 0:
+                details["checkpoint_offset_moved"] = moved
+                details["checkpoint_offset_stale"] = stale
+            entry = self._append_locked("audit_tail_repaired", details)
+            if moved > 0 and identity is not None:
+                self._checkpoint_locked(identity)
             return {"repaired": True, "fragments": len(bad), "bytes": len(fragment_bytes), "line_no": bad[0].line_no,
                     "fragment_sha256": sha256_hex(fragment_bytes), "method": how, "corrupt_file": str(self.corrupt_path),
-                    "recorded_seq": entry["seq"]}
+                    "recorded_seq": entry["seq"], "checkpoint_offset_stale": stale,
+                    "checkpoint_resigned": moved > 0 and identity is not None}
 
     # ------------------------------------------------------------- alerting
     def check_and_alert(self, expected_pub: str | None = None, sinks_from_env: bool = True, stream: Any = None) -> Break | None:
-        """Verify (incrementally from a valid checkpoint) and raise the alarm on any break. Never raises.
+        """Verify the chain and raise the alarm on any break. Never raises.
+
+        The whole chain is verified while the log is at most ``FULL_SCAN_MAX_BYTES`` (8 MiB, well under a
+        second), so an edit anywhere in the file, including a same-length one before the checkpoint, is
+        caught at every CLI start-up. Above that size only the part after the signed checkpoint is walked
+        (the checkpoint's seq and hash are authenticated); an edit before the checkpoint is then only
+        reported by ``verify``/``verify_detailed`` (``audit verify``).
 
         On a break: prints a one-line red banner to ``stream`` (sys.stderr by default; ANSI only on a TTY),
         appends an ``audit_chain_broken`` entry continuing from the last good entry (skipped when the last
@@ -577,18 +628,20 @@ class AuditLog:
         """
         stream = stream if stream is not None else sys.stderr
         try:
-            breaks, _ = self._verify(expected_pub, incremental=True)
+            try:
+                size = self.path.stat().st_size
+            except OSError:
+                size = 0
+            breaks, _ = self._verify(expected_pub, incremental=size > FULL_SCAN_MAX_BYTES)
             if not breaks:
                 return None
             first = breaks[0]
             extra = f" (+{len(breaks) - 1} more)" if len(breaks) > 1 else ""
             text = f"AUDIT CHAIN BROKEN: {self.path}: {first}{extra}"
-            try:
+            with contextlib.suppress(Exception):  # a closed or broken stream must not stop the log entry and the sinks
                 if getattr(stream, "isatty", lambda: False)():
                     text = "\x1b[1;31m" + text + "\x1b[0m"
                 print(text, file=stream, flush=True)
-            except Exception:
-                pass
             with contextlib.suppress(Exception):
                 with file_lock(self.path):
                     last, _ = self._tail_last_good()

@@ -6,8 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-from . import helpers  # noqa: F401
-from aiit.common.util import atomic_write_bytes, file_lock, new_id, safe_join, validate_id, write_json
+from aiit.common.util import atomic_write_bytes, new_id, safe_join, validate_id, write_json
 
 
 def _locked_append(args):
@@ -65,8 +64,6 @@ class AtomicWriteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "f.bin"
             atomic_write_bytes(p, b"old")
-            class Boom(bytes):
-                pass
             with self.assertRaises(TypeError):
                 atomic_write_bytes(p, "not-bytes")  # type: ignore[arg-type]
             self.assertEqual(p.read_bytes(), b"old")

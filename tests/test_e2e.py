@@ -4,11 +4,10 @@ import os
 import tempfile
 import threading
 import unittest
+import unittest.mock as mock
 import urllib.request
 from pathlib import Path
-from unittest import mock
 
-from . import helpers
 from aiit.agent import cli as agent_cli
 from aiit.agent import collectors
 from aiit.agent.collectors import Collector, collect_all

@@ -23,7 +23,13 @@ from typing import Any, Callable
 RETRY_STATUSES = (408, 425, 429, 500, 502, 503, 504)
 MAX_RESPONSE = 4 * 1024 * 1024
 ALLOWED_SCHEMES = ("http", "https")
+# A Retry-After up to this many seconds is honoured as given (not capped to max_backoff). A larger one
+# is a server telling us to go away for a while: the request fails at once with the value in the message.
+RETRY_AFTER_MAX = 120.0
 _sleep = time.sleep  # tests patch this instead of the global time module
+# Loopback, link-local and RFC1918/ULA targets (the console on the LAN, a local Ollama) are opened
+# with no proxy at all: an http_proxy/https_proxy from a managed desktop cannot reach them.
+_direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class NetError(Exception):
@@ -72,8 +78,12 @@ def http_json(
 
     body is JSON-encoded unless raw_body is given. Retries on connection
     errors, timeouts and retry_statuses with full-jitter exponential backoff,
-    honouring Retry-After. Never retries other 4xx. Raises HttpStatusError for
+    honouring a Retry-After header up to RETRY_AFTER_MAX seconds (a larger one
+    ends the call at once). Never retries other 4xx. Raises HttpStatusError for
     non-2xx after retries are exhausted and NetError for transport failures.
+    Private and loopback targets are opened directly, ignoring any proxy
+    variables in the environment; public hosts use the default (proxy-aware)
+    opener.
     """
     if retries is None:
         retries = _default_retries()
@@ -93,6 +103,7 @@ def http_json(
         data = None
     hdrs.setdefault("Accept", "application/json")
     hdrs.setdefault("User-Agent", "aiit/0.1")
+    opener = _direct_opener.open if is_loopback_or_private(url) else urllib.request.urlopen
 
     attempt = 0
     while True:
@@ -101,7 +112,7 @@ def http_json(
         retry_after: float | None = None
         try:
             # the URL scheme was validated against ALLOWED_SCHEMES at the top of this function
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
+            with opener(req, timeout=timeout) as resp:  # nosec B310
                 raw = _read_capped(resp, max_response)
                 if not expect_json:
                     return raw
@@ -115,12 +126,15 @@ def http_json(
             snippet = ""
             try:
                 snippet = e.read(512).decode("utf-8", "replace")
-            except Exception:
-                pass
+            except Exception:  # nosec B110 - the status is the error; an unreadable body only loses the snippet
+                snippet = ""
+            ra = e.headers.get("Retry-After") if e.headers else None
             if e.code in retry_statuses and attempt <= retries:
-                ra = e.headers.get("Retry-After") if e.headers else None
                 if ra and ra.strip().isdigit():
-                    retry_after = min(float(ra), max_backoff)
+                    retry_after = float(ra.strip())
+                    if retry_after > RETRY_AFTER_MAX:
+                        raise HttpStatusError(e.code, f"Retry-After {int(retry_after)}s exceeds {int(RETRY_AFTER_MAX)}s; "
+                                              f"not retrying: {snippet}", url) from e
                 err: Exception = HttpStatusError(e.code, snippet, url)
             else:
                 raise HttpStatusError(e.code, snippet, url) from e

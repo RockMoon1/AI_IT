@@ -98,7 +98,4 @@ class AgentState:
                                         "updated_at": iso()}, private=True)
 
     def clear_applying(self) -> None:
-        try:
-            self.applying_file.unlink()
-        except FileNotFoundError:
-            pass
+        self.applying_file.unlink(missing_ok=True)

@@ -11,7 +11,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from . import helpers  # noqa: F401  (puts src/ on sys.path)
 from aiit.common.policy import (
     DEFAULT_DENY,
     POLICY_VERSION,

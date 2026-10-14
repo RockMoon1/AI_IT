@@ -7,7 +7,6 @@ import json
 import unittest
 from pathlib import Path
 
-from . import helpers  # noqa: F401
 from aiit.common.redact import RedactionConfig, Redactor, SECRET_TOKEN, luhn_ok
 
 KEY = b"k" * 32

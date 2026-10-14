@@ -61,10 +61,10 @@ DEFAULT_DENY: list[str] = [
     r"\bclear-eventlog\b",
     r"\bwevtutil\s+(?:cl|clear-log)\b",
     r"(?:\bstop-service\b|\bsc(?:\.exe)?\s+stop\b|\bsc(?:\.exe)?\s+config\b)"
-    r".*\b(?:windefend|msmpsvc|sense|wscsvc|eventlog|mpssvc)\b",
+    + r".*\b(?:windefend|msmpsvc|sense|wscsvc|eventlog|mpssvc)\b",
     # --- Windows: persistence / living off the land ------------------------
     r"(?:\breg(?:\.exe)?\s+add\b|\bnew-itemproperty\b|\bset-itemproperty\b)"
-    r".*(?:\\run\b|\\runonce\b|\\winlogon\b|image file execution options)",
+    + r".*(?:\\run\b|\\runonce\b|\\winlogon\b|image file execution options)",
     r"\bschtasks\b.*\s/create\b",
     r"\bbitsadmin\b.*\s/transfer\b",
     r"\bcertutil\b.*(?:-urlcache\b|-decode\b)",

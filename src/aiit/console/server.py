@@ -7,6 +7,7 @@ explicitly passes --insecure-no-tls.
 """
 from __future__ import annotations
 
+import contextlib
 import hmac
 import json
 import os
@@ -25,7 +26,7 @@ from pydantic import ValidationError
 
 from .. import __version__
 from ..common.crypto import CryptoError
-from ..common.util import new_id, read_json, safe_join, validate_id
+from ..common.util import read_json, safe_join, validate_id
 from .store import ConsoleState
 
 MAX_BODY = 64 * 1024 * 1024
@@ -139,10 +140,8 @@ class MailboxHandler(BaseHTTPRequestHandler):
                 self.state.audit.record("serve_ingest_error", error=f"{type(e).__name__}: {str(e)[:200]}", ip=self._client_ip())
             self._json(500, {"error": "internal error"})
         finally:
-            try:
+            with contextlib.suppress(OSError):  # already gone or never created
                 tmp.unlink()
-            except OSError:
-                pass
 
     def do_GET(self) -> None:
         if not self._auth():
@@ -182,10 +181,9 @@ class MailboxServer(ThreadingHTTPServer):
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:  # type: ignore[override]
         if not self.slots.acquire(timeout=5.0):
-            try:
+            with contextlib.suppress(OSError):  # the peer may already be gone
                 request.close()
-            finally:
-                return
+            return
         try:
             if self.tls_context is not None:
                 try:
