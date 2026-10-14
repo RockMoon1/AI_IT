@@ -9,10 +9,11 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock as mock
 from pathlib import Path
-from unittest import mock
 
 from . import helpers
+from aiit.common import audit as audit_mod
 from aiit.common.audit import AuditLog, Break
 from aiit.common.crypto import Identity
 from aiit.common.util import read_json, sha256_hex, write_json
@@ -35,12 +36,7 @@ def _free_port() -> int:
     return port
 
 
-def _tamper_line(path: Path, index: int, mutate) -> None:
-    lines = path.read_bytes().split(b"\n")
-    e = json.loads(lines[index])
-    mutate(e)
-    lines[index] = json.dumps(e, sort_keys=True).encode("utf-8")
-    path.write_bytes(b"\n".join(lines))
+_tamper_line = helpers.tamper_audit_line
 
 
 class AuditTests(unittest.TestCase):
@@ -74,6 +70,8 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(log.entries(), [])
             e1 = log.record("init")
             e2 = log.record("ingest", case_id="case-000000000001")
+            if os.name != "nt":
+                self.assertEqual(log.path.stat().st_mode & 0o777, 0o600)  # created private, like the rest of the state dir
             self.assertEqual(log.head(), {"seq": 2, "hash": e2["hash"]})
             self.assertEqual(e2["prev_hash"], e1["hash"])
             self.assertEqual([e["seq"] for e in log.entries()], [1, 2])
@@ -225,7 +223,7 @@ class AuditTests(unittest.TestCase):
             self.assertIn("checkpoint unreadable", log.verify()[1])
 
     def test_check_and_alert_incremental_after_checkpoint(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(audit_mod, "FULL_SCAN_MAX_BYTES", 0):
             path = Path(d) / "audit.jsonl"
             log = AuditLog(path, actor_id="console-aaaaaaaaaaaa")
             ident = Identity.generate("console-aaaaaaaaaaaa", with_box=False)
@@ -235,13 +233,122 @@ class AuditTests(unittest.TestCase):
             for i in range(3):
                 log.record("more", i=i)
             out = io.StringIO()
-            self.assertIsNone(log.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=out))
+            with mock.patch.object(log, "_chain", wraps=log._chain) as chain:
+                self.assertIsNone(log.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=out))
             self.assertEqual(out.getvalue(), "")
+            # the walk really started at the checkpoint: only the three later entries were chained
+            self.assertEqual(chain.call_args.args[1:3], (log.entries()[3]["hash"], 4))
             _tamper_line(path, 5, lambda e: e["details"].__setitem__("i", 42))
             b = log.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=out)
             self.assertIsNotNone(b)
             self.assertEqual((b.line_no, b.seq), (6, 6))
             self.assertIn("hash mismatch at entry 6", out.getvalue())
+
+    def test_check_and_alert_pre_checkpoint_tamper(self):
+        """A same-length edit before the checkpoint: caught by the full scan below FULL_SCAN_MAX_BYTES, documented blind spot above."""
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "audit.jsonl"
+            log = AuditLog(path, actor_id="console-aaaaaaaaaaaa")
+            ident = Identity.generate("console-aaaaaaaaaaaa", with_box=False)
+            for i in range(4):
+                log.record("step", i=i)
+            log.checkpoint(ident)
+            log.record("more", i=0)
+            before = path.stat().st_size
+            _tamper_line(path, 1, lambda e: e["details"].__setitem__("i", 9))  # 0 -> 9 keeps the byte length
+            self.assertEqual(path.stat().st_size, before)
+            ok, msg = log.verify(expected_pub=ident.sign_pub_hex)
+            self.assertFalse(ok)
+            self.assertIn("hash mismatch at entry 2", msg)
+            # the start-up check (a few hundred bytes, far below the full-scan limit) sees it
+            self.assertLess(path.stat().st_size, audit_mod.FULL_SCAN_MAX_BYTES)
+            out = io.StringIO()
+            b = log.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=out)
+            self.assertIsInstance(b, Break)
+            self.assertEqual((b.line_no, b.seq), (2, 2))
+            self.assertIn("AUDIT CHAIN BROKEN", out.getvalue())
+            self.assertEqual(log.entries()[-1]["action"], "audit_chain_broken")
+            # above the limit only the part after the checkpoint is walked: the edit is invisible to
+            # check_and_alert (pinned here so a change of policy is a conscious one) but not to verify()
+            with mock.patch.object(audit_mod, "FULL_SCAN_MAX_BYTES", 0):
+                log2 = AuditLog(Path(d) / "big.jsonl", actor_id="console-aaaaaaaaaaaa")
+                for i in range(4):
+                    log2.record("step", i=i)
+                log2.checkpoint(ident)
+                log2.record("more", i=0)
+                _tamper_line(log2.path, 1, lambda e: e["details"].__setitem__("i", 9))
+                out = io.StringIO()
+                self.assertIsNone(log2.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=out))
+                self.assertEqual(out.getvalue(), "")
+                self.assertFalse(log2.verify(expected_pub=ident.sign_pub_hex)[0])
+                # but a truncation below the checkpoint or an edit after it is still caught in that mode
+                lines = log2.path.read_bytes().split(b"\n")
+                log2.path.write_bytes(b"\n".join(lines[:3]) + b"\n")
+                b = log2.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=io.StringIO())
+                self.assertIn("shorter than checkpoint", b.reason)
+
+    def test_repair_tail_splice_keeps_the_checkpoint_verifiable(self):
+        """Power loss mid-append, start-up check, a state change (checkpoint), then repair-tail: no endless alarm."""
+        for with_identity in (False, True):
+            with tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "audit.jsonl"
+                log = AuditLog(path, actor_id="console-aaaaaaaaaaaa")
+                ident = Identity.generate("console-aaaaaaaaaaaa", with_box=False)
+                log.record("a")
+                log.record("b")
+                with open(path, "ab") as f:
+                    f.write(b'{"seq": 3, "ts": ')
+                quiet = io.StringIO()
+                self.assertIn("torn", log.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=quiet).reason)
+                log.record("ingest")
+                cp = log.checkpoint(ident)
+                self.assertEqual(cp["seq"], 4)
+                result = log.repair_tail(identity=ident if with_identity else None)
+                self.assertEqual(result["method"], "spliced")
+                self.assertEqual(result["checkpoint_offset_stale"], not with_identity)
+                self.assertEqual(result["checkpoint_resigned"], with_identity)
+                ok, msg = log.verify(expected_pub=ident.sign_pub_hex)
+                self.assertTrue(ok, msg)
+                self.assertEqual(msg, "5 entries verified")
+                head = read_json(log.head_path)
+                repaired = log.entries()[-1]
+                self.assertEqual(repaired["action"], "audit_tail_repaired")
+                self.assertEqual(repaired["details"]["checkpoint_offset_moved"], 18)  # fragment plus the newline before 'ingest'
+                self.assertEqual(repaired["details"]["checkpoint_offset_stale"], not with_identity)
+                if with_identity:
+                    self.assertEqual((head["seq"], head["hash"], head["offset"]), (5, repaired["hash"], path.stat().st_size))
+                else:
+                    self.assertEqual((head["seq"], head["offset"]), (4, cp["offset"]))  # untouched: still signed, offset stale
+                # every later start-up check is quiet, in full-scan and in incremental mode, and no entry is added
+                for limit in (audit_mod.FULL_SCAN_MAX_BYTES, 0):
+                    with mock.patch.object(audit_mod, "FULL_SCAN_MAX_BYTES", limit):
+                        out = io.StringIO()
+                        self.assertIsNone(log.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=out))
+                        self.assertEqual(out.getvalue(), "")
+                self.assertEqual([e["action"] for e in log.entries()], ["a", "b", "audit_chain_broken", "ingest", "audit_tail_repaired"])
+                # the stale offset does not weaken the checkpoint: truncating below it is still caught
+                lines = path.read_bytes().split(b"\n")
+                path.write_bytes(b"\n".join(lines[:2]) + b"\n")
+                self.assertIn("shorter than checkpoint", log.verify(expected_pub=ident.sign_pub_hex)[1])
+                b = log.check_and_alert(expected_pub=ident.sign_pub_hex, sinks_from_env=False, stream=io.StringIO())
+                self.assertIn("shorter than checkpoint", b.reason)
+
+    def test_repair_tail_truncation_leaves_the_checkpoint_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "audit.jsonl"
+            log = AuditLog(path, actor_id="console-aaaaaaaaaaaa")
+            ident = Identity.generate("console-aaaaaaaaaaaa", with_box=False)
+            log.record("a")
+            cp = log.checkpoint(ident)
+            with open(path, "ab") as f:
+                f.write(b'{"seq": 2, "ts": ')
+            result = log.repair_tail(identity=ident)
+            self.assertEqual(result["method"], "truncated")
+            self.assertFalse(result["checkpoint_offset_stale"])
+            self.assertFalse(result["checkpoint_resigned"])
+            self.assertEqual(read_json(log.head_path), cp)
+            self.assertNotIn("checkpoint_offset_moved", log.entries()[-1]["details"])
+            self.assertTrue(log.verify(expected_pub=ident.sign_pub_hex)[0])
 
     def test_verify_detailed_lists_every_break(self):
         with tempfile.TemporaryDirectory() as d:
@@ -402,6 +509,32 @@ class AuditTests(unittest.TestCase):
                 b2 = log.check_and_alert(stream=io.StringIO())
             self.assertEqual(b2.line_no, 3)
             self.assertEqual(len(log.entries()), 5)
+
+    def test_syslog_sink_sends_a_datagram(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "audit.jsonl"
+            log = AuditLog(path, actor_id="console-1")
+            for i in range(3):
+                log.record("step", i=i)
+            _tamper_line(path, 1, lambda e: e["details"].__setitem__("i", "x"))
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.bind(("127.0.0.1", 0))
+                sock.settimeout(10)
+                target = "127.0.0.1:%d" % sock.getsockname()[1]
+                env = {"AIIT_ALERT_SYSLOG": target, "AIIT_ALERT_CMD": "", "AIIT_ALERT_WEBHOOK": ""}
+                with mock.patch.dict(os.environ, env):
+                    b = log.check_and_alert(stream=io.StringIO())
+                self.assertIsInstance(b, Break)
+                data, _ = sock.recvfrom(65535)
+            finally:
+                sock.close()
+            text = data.decode("utf-8")
+            self.assertRegex(text, r"^<\d+>")  # syslog priority, then the message
+            self.assertIn("aiit audit chain broken ", text)
+            payload = json.loads(text[text.index("{"):text.rindex("}") + 1])
+            self.assertEqual(payload, {"actor_id": "console-1", "seq": 2, "line_no": 2, "reason": b.reason, "log_path": str(path)})
+            self.assertIn("hash mismatch at entry 2", payload["reason"])
 
     def test_check_and_alert_failing_sinks_do_not_raise(self):
         with tempfile.TemporaryDirectory() as d:
