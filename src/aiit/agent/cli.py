@@ -7,6 +7,7 @@ import json
 import platform
 import shutil
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -14,8 +15,9 @@ from typing import Any
 from pydantic import ValidationError
 
 from .. import __version__
+from ..common import term
 from ..common.bundle import pack_dir, write_bundle
-from ..common.crypto import CryptoError
+from ..common.crypto import CryptoError, fingerprint, fingerprint_matches, set_passphrase_prompt
 from ..common.net import HttpStatusError, NetError, http_json
 from ..common.policy import Policy
 from ..common.schema import BundleManifest, Enrollment, SignedPlan
@@ -24,7 +26,7 @@ from .collectors import FAILURE_STATUSES, collect_all, collector_table_sha256, i
 from .executor import apply_plan, load_signed_plan, preflight, verify_signed_plan
 from .state import AgentState
 
-EXIT_USAGE, EXIT_NETWORK, EXIT_VERIFY, EXIT_POLICY = 2, 3, 4, 5
+EXIT_USAGE, EXIT_NETWORK, EXIT_VERIFY, EXIT_POLICY, EXIT_INTERRUPT = 2, 3, 4, 5, 130
 
 
 def _state(args: argparse.Namespace) -> AgentState:
@@ -62,8 +64,24 @@ def cmd_enroll(args: argparse.Namespace) -> None:
         sys.exit(f"{args.enrollment} is not a valid enrollment file: {type(e).__name__}")
     if st.is_enrolled() and not args.force:
         sys.exit(f"Already enrolled with console {st.enrollment().console_id}. Use --force to re-enroll.")
+    # The enrollment file is the trust anchor for every plan this endpoint will ever run, so
+    # its key is confirmed out of band: by a fingerprint the operator passes on the command
+    # line, or by reading it back and typing ENROLL. --yes is for lab scripts only.
+    fp = fingerprint(enr.console_sign_pub)
+    if args.fingerprint:
+        if not fingerprint_matches(args.fingerprint, fp):
+            sys.exit("console key fingerprint mismatch; not enrolling (the enrollment file may have been swapped)\n"
+                     f"  file:  {fp}\n  given: {args.fingerprint.strip()}")
+    elif not args.yes:
+        print(f"Console {enr.console_id} signing key fingerprint:\n  {fp}")
+        print("Compare it with what `aiit-console init` printed on the operator machine (or ask the operator).")
+        answer = input("Type ENROLL to trust this console: ")
+        if answer.strip() != "ENROLL":
+            sys.exit("Not enrolled.")
     ident = st.enroll(enr)
     print(f"Enrolled. agent_id={ident.id} console_id={enr.console_id}")
+    print(f"Console key fingerprint: {fp}")
+    print(f"This agent's key fingerprint: {st.identity_fingerprint()}")
     print(f"State dir: {st.root}")
     pol = st.policy()
     print(f"Policy: {st.policy_file} (mode={pol.mode}, max_risk={pol.max_risk}, digest={pol.digest()[:12]})")
@@ -181,7 +199,7 @@ def _selftest_text(rep: dict[str, Any]) -> str:
         f"{'collector':34} {'admin':5} {'status':12} {'exit':>5} {'ms':>7} {'bytes':>9} {'stderr':>7}  error class",
     ]
     for r in rep["collectors"]:
-        lines.append(f"{r['category'] + '/' + r['name']:34} {'yes' if r['requires_admin'] else '':5} {r['status']:12} "
+        lines.append(f"{r['category'] + '/' + r['name']:34} {'yes' if r['requires_admin'] else '':5} {term.status_label(r['status'], 12)} "
                      f"{'' if r['exit_code'] is None else r['exit_code']:>5} {r['duration_ms']:>7} {r['size']:>9} {r['stderr_size']:>7}  "
                      f"{r['error_class'] or ''}")
     lines.append("")
@@ -437,23 +455,43 @@ def cmd_apply(args: argparse.Namespace) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     st = _state(args)
-    print(f"aiit-agent {__version__}  state={st.root}")
     if not st.is_enrolled():
-        print("Not enrolled.")
+        if args.json:
+            print(json.dumps({"aiit_version": __version__, "state_dir": str(st.root), "enrolled": False}, indent=2))
+        else:
+            print(f"aiit-agent {__version__}  state={st.root}")
+            print("Not enrolled.")
         return
     ident = st.identity()
     enr = st.enrollment()
     pol = st.policy()
+    marker = st.applying()
+    ok, msg = st.audit.verify(expected_pub=ident.sign_pub_hex)
+    if args.json:
+        print(json.dumps({
+            "aiit_version": __version__, "state_dir": str(st.root), "enrolled": True,
+            "agent_id": ident.id, "agent_fingerprint": st.identity_fingerprint(), "hostname": hostname(), "os": current_os(),
+            "console_id": enr.console_id, "console_fingerprint": st.console_fingerprint(),
+            "policy": {"mode": pol.mode, "max_risk": pol.max_risk, "max_plan_hours": pol.max_plan_hours,
+                       "deny_patterns": len(pol.deny_patterns), "allow_patterns": len(pol.allow_patterns), "digest": pol.digest()},
+            "applied_plans": len(st.applied_plan_ids()),
+            "interrupted_run": marker,
+            "audit": {"ok": ok, "detail": msg, "head": st.audit.head()},
+        }, indent=2))
+        return
+    print(f"aiit-agent {__version__}  state={st.root}")
     print(f"agent_id={ident.id}  host={hostname()}  os={current_os()}")
-    print(f"console_id={enr.console_id}  console_sign_pub={enr.console_sign_pub[:16]}...")
+    print(f"agent key fingerprint:   {st.identity_fingerprint()}")
+    print(f"console_id={enr.console_id}")
+    print(f"console key fingerprint: {st.console_fingerprint()}")
     print(f"policy: mode={pol.mode} max_risk={pol.max_risk} max_plan_hours={pol.max_plan_hours} deny_patterns={len(pol.deny_patterns)} "
           f"allow_patterns={len(pol.allow_patterns)} digest={pol.digest()[:16]}")
     print(f"applied plans: {len(st.applied_plan_ids())}")
-    marker = st.applying()
     if marker:
-        print(f"INTERRUPTED enforce run: plan {marker.get('plan_id')} (completed {len(marker.get('completed', []))} step(s)); use apply --resume")
-    ok, msg = st.audit.verify(expected_pub=ident.sign_pub_hex)
-    print(f"audit chain: {'OK' if ok else 'BROKEN'} ({msg})")
+        print(term.paint(f"INTERRUPTED enforce run: plan {marker.get('plan_id')} (completed {len(marker.get('completed', []))} step(s)); "
+                         "use apply --resume", "yellow", "bold"))
+    verdict = term.paint("OK", "green") if ok else term.paint("BROKEN", "red", "bold")
+    print(f"audit chain: {verdict} ({msg})")
 
 
 def cmd_policy(args: argparse.Namespace) -> None:
@@ -514,11 +552,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="aiit-agent", description="AI_IT endpoint agent")
     p.add_argument("--data-dir", help="state directory (default: AIIT_AGENT_DIR or ~/.aiit/agent)")
     p.add_argument("--debug", action="store_true", help="show tracebacks")
+    p.add_argument("--no-color", action="store_true", help="plain output (also NO_COLOR=1)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("enroll", help="trust a console using its public enrollment file")
     s.add_argument("enrollment")
     s.add_argument("--force", action="store_true")
+    s.add_argument("--fingerprint", metavar="FP", help="the console key fingerprint printed by `aiit-console init`; enrollment is refused on a mismatch")
+    s.add_argument("--yes", action="store_true", help="skip the typed ENROLL confirmation (lab scripts only; prefer --fingerprint)")
     s.set_defaults(func=cmd_enroll)
 
     s = sub.add_parser("collect", help="collect diagnostics into an encrypted bundle")
@@ -568,6 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_pull)
 
     s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true", help="machine readable status on stdout")
     s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("policy", help="show or change the local execution policy")
@@ -598,32 +640,59 @@ def main(argv: list[str] | None = None) -> None:
         with contextlib.suppress(AttributeError, ValueError, OSError):
             stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
-    if args.cmd not in ("enroll",):
-        try:
-            st = AgentState(Path(args.data_dir) if args.data_dir else None)
-            if st.is_enrolled():
-                st.audit.check_and_alert(expected_pub=st.public_sign_key())
-        except Exception as e:  # pragma: no cover - the check must never block the command
-            if args.debug:
-                raise
-            print(f"warning: audit check skipped: {type(e).__name__}", file=sys.stderr)
+    if args.no_color:
+        term.set_color(False)
+    set_passphrase_prompt(True)  # an encrypted key with no AIIT_KEY_PASSPHRASE* set asks on the terminal
     try:
+        if args.cmd not in ("enroll",):
+            try:
+                st = AgentState(Path(args.data_dir) if args.data_dir else None)
+                if st.is_enrolled():
+                    st.audit.check_and_alert(expected_pub=st.public_sign_key())
+            except PermissionError:
+                raise  # a refused state directory is the command's error, reported below
+            except Exception as e:  # pragma: no cover - the check must never block the command
+                if args.debug:
+                    raise
+                print(f"warning: audit check skipped: {type(e).__name__}", file=sys.stderr)
         args.func(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(EXIT_INTERRUPT)
+    except EOFError:
+        term.report_error("no answer on stdin (not a terminal?)", "run interactively, or pass --yes where the command supports it")
+        sys.exit(EXIT_USAGE)
     except CryptoError as e:
         if args.debug:
             raise
-        print(f"error: {e}", file=sys.stderr)
+        term.report_error(str(e), "the plan or enrollment file may be for another console, tampered, or sealed with a newer version")
         sys.exit(EXIT_VERIFY)
     except NetError as e:
         if args.debug:
             raise
-        print(f"network error: {e}", file=sys.stderr)
+        term.report_error(str(e), "the bundle is kept locally; retry with `aiit-agent push --outbox` once the console is reachable",
+                          label="network error")
         sys.exit(EXIT_NETWORK)
+    except tarfile.TarError as e:
+        if args.debug:
+            raise
+        term.report_error(f"archive is damaged: {e}", "fetch the plan again from the console")
+        sys.exit(EXIT_VERIFY)
+    except PermissionError as e:
+        if args.debug:
+            raise
+        term.report_error(str(e), "fix the state directory as shown, or set AIIT_ALLOW_LOOSE_STATE_DIR=1 to continue with a warning")
+        sys.exit(EXIT_USAGE)
     except (ValidationError, ValueError, FileNotFoundError) as e:
         if args.debug:
             raise
-        print(f"error: {str(e).splitlines()[0][:300]}", file=sys.stderr)
+        term.report_error(str(e), "run with --debug for the full traceback")
         sys.exit(EXIT_USAGE)
+    except OSError as e:
+        if args.debug:
+            raise
+        term.report_error(f"{type(e).__name__}: {e}", "check disk space and permissions on the agent state directory")
+        sys.exit(1)
 
 
 if __name__ == "__main__":  # pragma: no cover

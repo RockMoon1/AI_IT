@@ -12,7 +12,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from .. import __version__
-from ..common.crypto import CryptoError
+from ..common.crypto import CryptoError, key_file_is_encrypted, set_passphrase_prompt
 from ..common.net import NetError
 from ..common import term
 from ..common.redact import RedactionConfig
@@ -41,11 +41,14 @@ def cmd_init(args: argparse.Namespace) -> None:
     except RuntimeError as e:
         sys.exit(str(e))
     print(f"Console initialized: {enr.console_id}")
+    print(f"Signing key fingerprint (give this to whoever enrolls endpoints; `aiit-agent enroll --fingerprint` checks it):")
+    print(f"  {st.identity_fingerprint()}")
     print(f"State dir (keep private, back up the keys): {st.root}")
     print(f"Enrollment file to copy to endpoints (public): {st.enrollment_file}")
     print(f"Put provider settings in {st.root / '.env'} (see .env.example); the console never reads .env from the current directory.")
-    if not os.environ.get("AIIT_KEY_PASSPHRASE"):
-        print("Note: AIIT_KEY_PASSPHRASE was not set, so private keys are stored unencrypted. Set it before init for at-rest key encryption.")
+    if not key_file_is_encrypted(st.keys_dir / "sign.key"):
+        print("Note: no key passphrase was configured, so private keys are stored unencrypted. Set AIIT_KEY_PASSPHRASE or "
+              "AIIT_KEY_PASSPHRASE_FILE (or answer the prompt) before init for at-rest key encryption.")
     st.audit.checkpoint(st.identity())
 
 
@@ -422,22 +425,25 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.no_color:
         term.set_color(False)
+    set_passphrase_prompt(True)  # an encrypted key with no AIIT_KEY_PASSPHRASE* set asks on the terminal
     root = Path(args.data_dir) if args.data_dir else default_console_dir()
     try:
         load_dotenv(explicit=Path(args.env_file) if args.env_file else None, console_dir=root)
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         sys.exit(EXIT_USAGE)
-    if args.cmd not in ("init",):
-        try:
-            st = ConsoleState(root)
-            if st.is_initialized():
-                st.audit.check_and_alert(expected_pub=st.public_sign_key())
-        except Exception as e:  # pragma: no cover - the check must never block the command
-            if args.debug:
-                raise
-            print(f"warning: audit check skipped: {type(e).__name__}", file=sys.stderr)
     try:
+        if args.cmd not in ("init",):
+            try:
+                st = ConsoleState(root)
+                if st.is_initialized():
+                    st.audit.check_and_alert(expected_pub=st.public_sign_key())
+            except PermissionError:
+                raise  # a refused state directory is the command's error, reported below
+            except Exception as e:  # pragma: no cover - the check must never block the command
+                if args.debug:
+                    raise
+                print(f"warning: audit check skipped: {type(e).__name__}", file=sys.stderr)
         args.func(args)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
@@ -469,6 +475,11 @@ def main(argv: list[str] | None = None) -> None:
         if args.debug:
             raise
         term.report_error(str(e), "run with --debug for the full traceback")
+        sys.exit(EXIT_USAGE)
+    except PermissionError as e:
+        if args.debug:
+            raise
+        term.report_error(str(e), "fix the console directory as shown, or set AIIT_ALLOW_LOOSE_STATE_DIR=1 to continue with a warning")
         sys.exit(EXIT_USAGE)
     except OSError as e:
         if args.debug:

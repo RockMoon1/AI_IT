@@ -32,7 +32,7 @@ class AgentCliBase(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.console = helpers.make_console(self.root / "console")
         self.adir = self.root / "agent"
-        self.agent("enroll", str(self.console.enrollment_file))
+        self.agent("enroll", str(self.console.enrollment_file), "--yes")
         self.state = AgentState(self.adir)
         self.ident = self.state.identity()
         self.patch = mock.patch.object(collectors, "collectors_for", fake_collectors)
@@ -71,10 +71,65 @@ class EnrollTests(AgentCliBase):
         bad.write_text('{"console_id": "nope"}')
         code, out = self.agent_exit("enroll", str(bad))
         self.assertIn("not a valid enrollment file", out)
-        code, out = self.agent_exit("enroll", str(self.console.enrollment_file))
+        code, out = self.agent_exit("enroll", str(self.console.enrollment_file), "--yes")
         self.assertIn("Already enrolled", out)
-        out = self.agent("enroll", str(self.console.enrollment_file), "--force")
+        out = self.agent("enroll", str(self.console.enrollment_file), "--force", "--yes")
         self.assertIn("Enrolled.", out)
+
+    def test_fingerprint_confirms_or_refuses_the_console_key(self):
+        from aiit.common.crypto import fingerprint
+        fp = fingerprint(self.console.identity().sign_pub_hex)
+        # a mismatch is refused before anything is written
+        wrong = ("0000 " * 16).strip()
+        code, out = self.agent_exit("enroll", str(self.console.enrollment_file), "--force", "--fingerprint", wrong)
+        self.assertIn("fingerprint mismatch", out)
+        self.assertIn(fp, out)
+        # tolerant spelling of the right one is accepted and echoed
+        out = self.agent("enroll", str(self.console.enrollment_file), "--force", "--fingerprint", fp.replace(" ", ":").upper())
+        self.assertIn("Enrolled.", out)
+        self.assertIn(f"Console key fingerprint: {fp}", out)
+        self.assertIn("This agent's key fingerprint:", out)
+        self.assertEqual(self.state.console_fingerprint(), fp)
+
+    def test_typed_enroll_confirmation(self):
+        with mock.patch("builtins.input", return_value="nope"):
+            code, out = self.agent_exit("enroll", str(self.console.enrollment_file), "--force")
+        self.assertIn("Not enrolled", out)
+        with mock.patch("builtins.input", return_value="ENROLL") as asked:
+            out = self.agent("enroll", str(self.console.enrollment_file), "--force")
+        self.assertIn("Enrolled.", out)
+        self.assertIn("fingerprint", out)
+        asked.assert_called_once()
+        # no terminal at all: a clean usage error, not a traceback
+        with mock.patch("builtins.input", side_effect=EOFError):
+            code, out = self.agent_exit("enroll", str(self.console.enrollment_file), "--force")
+        self.assertEqual(code, 2)
+        self.assertIn("--yes", out)
+
+    def test_status_json_and_plain_carry_both_fingerprints(self):
+        data = json.loads(self.agent("status", "--json"))
+        self.assertTrue(data["enrolled"])
+        self.assertEqual(data["agent_fingerprint"], self.state.identity_fingerprint())
+        self.assertEqual(data["console_fingerprint"], self.state.console_fingerprint())
+        self.assertTrue(data["audit"]["ok"])
+        self.assertEqual(data["policy"]["mode"], "dry_run")
+        plain = self.agent("--no-color", "status")
+        self.assertIn(self.state.console_fingerprint(), plain)
+        self.assertNotIn("\x1b[", plain)
+
+    def test_error_surface_exit_codes(self):
+        with mock.patch.object(agent_cli, "cmd_status", side_effect=KeyboardInterrupt):
+            code, out = self.agent_exit("status")
+        self.assertEqual(code, 130)
+        with mock.patch.object(agent_cli, "cmd_status", side_effect=PermissionError("state dir is group writable; run chmod 700")):
+            code, out = self.agent_exit("status")
+        self.assertEqual(code, 2)
+        self.assertIn("AIIT_ALLOW_LOOSE_STATE_DIR", out)
+        self.assertNotIn("Traceback", out)
+        with mock.patch.object(agent_cli, "cmd_status", side_effect=OSError(28, "No space left on device")):
+            code, out = self.agent_exit("status")
+        self.assertEqual(code, 1)
+        self.assertIn("No space left", out)
 
 
 class PullTests(AgentCliBase):

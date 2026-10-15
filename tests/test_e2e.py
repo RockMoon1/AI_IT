@@ -10,7 +10,7 @@ from pathlib import Path
 
 from aiit.agent import cli as agent_cli
 from aiit.agent import collectors
-from aiit.agent.collectors import Collector, collect_all
+from aiit.agent.collectors import Collector
 from aiit.common.schema import SignedPlan
 from aiit.common.util import current_os, read_json
 from aiit.console import cli as console_cli
@@ -51,7 +51,7 @@ class EndToEndTests(unittest.TestCase):
         enr = self.cdir / "enrollment" / "console-enrollment.json"
         self.assertTrue(enr.exists())
         self.assertNotIn("sign.key", enr.read_text())
-        self.agent("enroll", str(enr))
+        self.agent("enroll", str(enr), "--yes")
         bundle = self.usb / "case.aiit"
         self.agent("collect", "--issue", "printer offline for jdoe@example.org", "--out", str(bundle), "--no-osquery", "--quick")
         self.assertTrue(bundle.exists())
@@ -124,7 +124,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_lan_mode(self):
         self.console("init")
-        self.agent("enroll", str(self.cdir / "enrollment" / "console-enrollment.json"))
+        self.agent("enroll", str(self.cdir / "enrollment" / "console-enrollment.json"), "--yes")
         st = ConsoleState(self.cdir)
         srv = make_server(st, "127.0.0.1", 0, TOKEN)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -153,19 +153,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(st.audit.verify()[0])
 
 
-class RealCollectorSmokeTest(unittest.TestCase):
-    """Runs the real quick collectors for this OS; only checks that every collector produced a file."""
-
-    def test_quick_collectors_produce_files(self):
-        with tempfile.TemporaryDirectory() as d:
-            entries = collect_all(Path(d), quick=True, include_osquery=False)
-            self.assertGreater(len(entries), 5)
-            for e in entries:
-                self.assertTrue((Path(d) / e.path).exists(), e.path)
-                self.assertEqual(len(e.sha256), 64)
-            ok = [e for e in entries if e.error is None and (e.exit_code in (0, None))]
-            self.assertGreater(len(ok), 3, [(e.path, e.error, e.exit_code) for e in entries])
-
+# The real quick collector set is exercised once per OS by
+# tests.test_collectors.RealQuickSetTests (invariants plus pinned outcomes on
+# the GitHub runners); a second run here would only add minutes on Windows.
 
 if __name__ == "__main__":
     unittest.main()
