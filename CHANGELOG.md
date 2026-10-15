@@ -136,6 +136,68 @@ signed plan wire formats; existing bundles and plans remain readable.
 
 ### Added
 
+PR 2, "Operators and platforms" (in progress on this branch):
+
+- `aiit-console dashboard`: a read-only status page bound to loopback only
+  (cases, plans with risk colouring, report results, agents, audit chain
+  state), no authentication surface, nothing writes. The full browser console
+  (login, idle logoff, approval in the browser) is designed in the roadmap.
+- OpenAI-compatible provider: `--provider openai`, `azure-openai`,
+  `openai-compat`, or the local presets `llamacpp`, `vllm`, `lmstudio`; one
+  class over the chat-completions wire format with no SDK dependency, strict
+  JSON-schema output with a degrade ladder, keys sent only as a header and
+  never audited (`AIIT_OPENAI_BASE_URL`, `AIIT_OPENAI_MODEL`,
+  `AIIT_OPENAI_API_KEY` or `OPENAI_API_KEY`, `AIIT_AZURE_OPENAI_DEPLOYMENT`,
+  `AIIT_AZURE_OPENAI_API_VERSION`). Bedrock and Vertex stay out of scope.
+- Hosted-provider gate: a provider that sends case data off the machine is
+  refused unless `--allow-hosted` or `AIIT_ALLOW_HOSTED=1` is given. An
+  explicit `--fallback <provider>` on `diagnose` is tried when the first
+  provider fails; it may only move towards a more private provider
+  (hosted -> local -> dryrun) and is audited as `llm_fallback`. A truncated
+  model context is reported as a plan warning.
+- Terminal output on both CLIs: colour that honours `NO_COLOR`, `FORCE_COLOR`
+  and the Windows console, risk and status labels, a spinner while the model
+  works, `--no-color`, `--json` on `report` and `aiit-agent status`. Errors
+  print one line with a hint (traceback only with `--debug`); exit codes
+  2 usage, 3 provider or network, 4 verification, 5 policy, 130 interrupted,
+  1 for an operating-system error.
+- Collectors for field testing: every collected file carries a `status`
+  (`ok`, `nonzero`, `timeout`, `missing`, `denied`, `empty`, `invalid_json`)
+  classified from the exit code, stderr markers and the output; stderr goes
+  to a `<name>.stderr.txt` sidecar instead of being appended to JSON;
+  collectors that need elevation are marked and a denied result says so;
+  the manifest records whether the agent was elevated, the policy digest and
+  mode, whether the agent is a frozen executable and which collector set and
+  table produced the bundle. No collector runs through `sh -c` any more
+  (head/tail are done in Python); narrower `ps` columns; hardware serials
+  and UUIDs are dropped from macOS hardware output at collection time.
+  Renamed or split collectors: Linux `apt_history` plus `dnf_history`,
+  `crontab` plus `cron_d`; macOS `security` is now `gatekeeper`, `filevault`
+  and `sip`.
+- `aiit-agent selftest [--full] [--json|--markdown] [--seal OUT] [--strict]`:
+  runs every collector for this OS and prints per-collector metadata only
+  (status, exit code, duration, size, error class), never content or the
+  hostname, for field-test reports. CI uploads the JSON report per runner.
+- Endpoint key protection: state directories get a restrictive Windows ACL
+  (`icacls /inheritance:r`, SYSTEM and Administrators for the agent, the
+  current user for the console) and a pre-existing directory owned by
+  someone else or writable by others is refused (`AIIT_ALLOW_LOOSE_STATE_DIR=1`
+  turns that into a warning). The key passphrase comes from
+  `AIIT_KEY_PASSPHRASE`, then `AIIT_KEY_PASSPHRASE_FILE`, then a terminal
+  prompt (`AIIT_NO_PROMPT=1` disables it). `aiit-console init` and
+  `aiit-agent enroll` print key fingerprints; `enroll --fingerprint` refuses
+  a mismatch and without it a typed `ENROLL` is required (`--yes` for lab
+  scripts). `aiit-agent status --json` reports both fingerprints.
+- Packaging and release: `pyproject.toml` reads the version from the package,
+  ships `py.typed`, declares a `release` extra; `packaging/` holds PyInstaller
+  entry points and specs; `.github/workflows/release.yml` builds the wheel and
+  sdist, one-file and one-folder binaries for Linux, Windows and macOS (arm64
+  and x86_64) with a dry-run smoke loop, per-OS offline wheelhouse zips,
+  `SHA256SUMS`, a build provenance attestation and a GitHub Release from the
+  CHANGELOG section, then publishes to PyPI (or TestPyPI for pre-release
+  tags) through trusted publishing. Binaries are unsigned for now. See
+  `docs/release-process.md`.
+
 - `aiit-agent push <file|--outbox>` to upload bundles or reports that were
   kept locally after a failed push; `AIIT_SERVER_TOKEN_FILE` as an
   alternative to the environment variable; on push failure the bundle is kept
@@ -197,8 +259,6 @@ signed plan wire formats; existing bundles and plans remain readable.
 - Anthropic provider: an SDK too old for server-side fallbacks degrades to a
   plain request instead of crashing with a `TypeError`; one too old for
   `output_config` reports a clear `ProviderError`.
-- `.env.example` no longer lists `AIIT_KEY_PASSPHRASE_FILE`; nothing reads it
-  yet (planned for the next release with the Windows key-protection work).
 - Agent `push --outbox` pushes every bundle and reports each failure instead
   of stopping at the first one; it exits 3 at the end if any failed.
 - An interrupted enforce run is refused on the next `apply` unless `--resume`

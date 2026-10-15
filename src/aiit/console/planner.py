@@ -24,6 +24,7 @@ from ..common.policy import Policy
 from ..common.redact import RedactionConfig, Redactor
 from ..common.schema import RISK_ORDER, FixPlan, FixPlanDraft, SignedPlan, plan_json_schema
 from ..common.util import iso, new_id, os_user, parse_iso, read_json, safe_join, truncate, utcnow, write_json
+from ..common import term
 from .llm import LLMProvider, ProviderError, ProviderOutputError, ProviderRefusal
 from .store import ConsoleState
 
@@ -191,6 +192,33 @@ def _repair_suffix(red: Redactor, delim: str, problems: list[str], raw_text: str
     return text
 
 
+def privacy_rank(provider: LLMProvider) -> int:
+    """0 = no model at all (dryrun), 1 = a model on this machine or LAN, 2 = a hosted service."""
+    if getattr(provider, "name", "") == "dryrun":
+        return 0
+    return 2 if getattr(provider, "hosted", False) else 1
+
+
+def check_hosted_allowed(provider: LLMProvider, allowed: bool) -> None:
+    """Hosted providers send redacted case text off the machine; that needs an explicit opt-in.
+
+    Raises ProviderError naming the switch when ``provider.hosted`` and the
+    operator has not passed ``--allow-hosted`` or set ``AIIT_ALLOW_HOSTED=1``.
+    """
+    if getattr(provider, "hosted", False) and not allowed:
+        raise ProviderError(
+            f"provider {provider.name!r} sends case data to {getattr(provider, 'endpoint_host', 'a hosted service')}; "
+            "pass --allow-hosted or set AIIT_ALLOW_HOSTED=1 once a business associate agreement covers it")
+
+
+def check_fallback_more_private(primary: LLMProvider, fallback: LLMProvider) -> None:
+    """A fallback may only move towards more privacy (hosted -> local -> dryrun), never the other way."""
+    if privacy_rank(fallback) > privacy_rank(primary):
+        raise ProviderError(
+            f"fallback {fallback.name!r} is less private than {primary.name!r}; a fallback may only move towards "
+            "a local model or the dryrun checklist")
+
+
 def diagnose(state: ConsoleState, case_id: str, issue: str, provider: LLMProvider, max_chars: int = 150_000,
              hours_valid: float = DEFAULT_PLAN_HOURS, repairs: int | None = None, *,
              max_plan_hours: float = MAX_PLAN_HOURS_DEFAULT, long_lived: bool = False) -> tuple[FixPlan, list[str]]:
@@ -262,6 +290,9 @@ def diagnose(state: ConsoleState, case_id: str, issue: str, provider: LLMProvide
                             "the rejected output is saved privately at " + str(rejected) + "\n  - " + "\n  - ".join(problems[:8]))
     assert draft is not None
     warnings = lint_plan(draft, case["platform"])
+    if total_usage.get("context_truncated"):
+        warnings.append("the provider reported a truncated context window: part of the case was not read; "
+                        "lower --max-chars or raise the model's context (AIIT_OLLAMA_NUM_CTX)")
     now = utcnow()  # one instant for both stamps so the lifetime is exactly hours_valid
     plan = FixPlan(
         **draft.model_dump(), plan_id=new_id("plan-"), case_id=case_id, target_agent_id=case["agent_id"], target_os=case["platform"],
@@ -346,7 +377,8 @@ def format_plan(plan: FixPlan, warnings: list[str] | None = None) -> str:
         lines.append("Alternatives: " + "; ".join(plan.alternative_causes))
     lines.append("")
     for s in plan.steps:
-        lines.append(f"[{s.id}] ({s.risk}{', reboot' if s.requires_reboot else ''}) {s.title}")
+        risk = term.paint(s.risk, *term.RISK_STYLES.get(s.risk, ()))
+        lines.append(f"[{s.id}] ({risk}{', reboot' if s.requires_reboot else ''}) {s.title}")
         lines.append(f"     why: {s.rationale}")
         if s.action == "command":
             lines.append(f"     $ {s.command}")
@@ -358,7 +390,7 @@ def format_plan(plan: FixPlan, warnings: list[str] | None = None) -> str:
             lines.append(f"     rollback: {s.rollback}")
         for w in (warnings or []):
             if w.startswith(f"step {s.id} ") or w.startswith(f"duplicate step id {s.id}"):
-                lines.append(f"     WARNING: {w}")
+                lines.append(f"     {term.paint('WARNING:', 'yellow', 'bold')} {w}")
     if plan.more_data_needed:
         lines.append("\nMore data needed: " + "; ".join(plan.more_data_needed))
     if plan.notes_for_operator:

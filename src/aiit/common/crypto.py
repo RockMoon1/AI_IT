@@ -6,7 +6,15 @@ Primitives (all from the `cryptography` package):
 """
 from __future__ import annotations
 
+import base64
+import codecs
+import getpass
+import hashlib
+import hmac
 import os
+import re
+import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,20 +29,129 @@ from .util import canonical_json, read_json, sha256_hex, write_json, write_priva
 
 HKDF_INFO = b"aiit-bundle-v1"
 
+PASSPHRASE_ENV = "AIIT_KEY_PASSPHRASE"
+PASSPHRASE_FILE_ENV = "AIIT_KEY_PASSPHRASE_FILE"
+NO_PROMPT_ENV = "AIIT_NO_PROMPT"
+RAW_PUBLIC_KEY_LEN = 32  # Ed25519 and X25519
+
 
 class CryptoError(Exception):
     pass
 
 
+# ---------------------------------------------------------------- passphrase
+
+# Interactive prompting is opt-in: the CLIs enable it in main(); library use
+# and the test-suite never block on a terminal.
+_prompt_allowed = False
+# The answer typed at the prompt, kept for the rest of the process so a console
+# with two key files (sign.key, box.key) asks once, not twice.
+_prompt_answer: list[bytes | None] = []
+
+
+def set_passphrase_prompt(enabled: bool) -> None:
+    """Allow (or forbid) ``_passphrase`` to ask on the terminal; also forgets any earlier answer."""
+    global _prompt_allowed
+    _prompt_allowed = bool(enabled)
+    _prompt_answer.clear()
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _can_prompt() -> bool:
+    if not _prompt_allowed or _truthy(os.environ.get(NO_PROMPT_ENV)):
+        return False
+    stream = sys.stdin
+    try:
+        return stream is not None and bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _read_passphrase_file(path: Path) -> bytes:
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        raise CryptoError(f"{PASSPHRASE_FILE_ENV}={path}: {e.strerror or e}") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise CryptoError(f"{PASSPHRASE_FILE_ENV}={path} is not a regular file")
+    if os.name != "nt" and st.st_mode & (stat.S_IRWXO):
+        raise CryptoError(f"refusing {PASSPHRASE_FILE_ENV}={path}: it is accessible by other users "
+                          f"(mode {stat.S_IMODE(st.st_mode):04o}); chmod 600 it")
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        raise CryptoError(f"{PASSPHRASE_FILE_ENV}={path}: {e.strerror or e}") from None
+    first = data.split(b"\n", 1)[0].rstrip(b"\r")
+    if first.startswith(codecs.BOM_UTF8):
+        first = first[len(codecs.BOM_UTF8):]
+    if not first:
+        raise CryptoError(f"{PASSPHRASE_FILE_ENV}={path} is empty (the first line is the passphrase)")
+    return first
+
+
+def _prompt_passphrase(confirm: bool) -> bytes | None:
+    if _prompt_answer:
+        return _prompt_answer[0]
+    first = getpass.getpass("Key passphrase (empty for an unencrypted key): ")
+    if confirm and first:
+        if getpass.getpass("Repeat passphrase: ") != first:
+            raise CryptoError("the passphrases do not match")
+    answer = first.encode("utf-8") if first else None
+    _prompt_answer.append(answer)
+    return answer
+
+
+def passphrase_source() -> str | None:
+    """Where a passphrase would come from without asking: ``"env"``, ``"file"`` or None."""
+    if os.environ.get(PASSPHRASE_ENV):
+        return "env"
+    if os.environ.get(PASSPHRASE_FILE_ENV):
+        return "file"
+    return None
+
+
+def _passphrase(*, confirm: bool = False) -> bytes | None:
+    """The passphrase that encrypts private keys at rest, or None for an unencrypted key.
+
+    Precedence:
+
+    1. ``AIIT_KEY_PASSPHRASE`` when set and non-empty.
+    2. ``AIIT_KEY_PASSPHRASE_FILE``: the first line of that file, trailing
+       newline stripped. A missing or empty file is a CryptoError; on POSIX a
+       file that other users can access (any ``o`` bit) is refused.
+    3. An interactive ``getpass`` prompt, when ``set_passphrase_prompt(True)``
+       was called, ``AIIT_NO_PROMPT`` is not set and stdin is a terminal. The
+       answer is remembered for the rest of the process. With ``confirm`` the
+       prompt is repeated and a mismatch is a CryptoError. An empty answer
+       means no passphrase.
+    4. None: keys are stored unencrypted (the CLIs print a note).
+    """
+    env = os.environ.get(PASSPHRASE_ENV)
+    if env:
+        return env.encode("utf-8")
+    file = os.environ.get(PASSPHRASE_FILE_ENV)
+    if file:
+        return _read_passphrase_file(Path(file))
+    if _can_prompt():
+        return _prompt_passphrase(confirm)
+    return None
+
+
 # ---------------------------------------------------------------- key files
 
-def _passphrase() -> bytes | None:
-    p = os.environ.get("AIIT_KEY_PASSPHRASE")
-    return p.encode("utf-8") if p else None
+def key_pem_is_encrypted(pem: bytes) -> bool:
+    return b"ENCRYPTED" in pem
 
 
-def _save_private(path: Path, key: Any) -> None:
-    pw = _passphrase()
+def key_file_is_encrypted(path: Path) -> bool:
+    """True when the PEM private key at ``path`` is stored encrypted (no passphrase needed to tell)."""
+    return key_pem_is_encrypted(Path(path).read_bytes())
+
+
+def _save_private(path: Path, key: Any, pw: bytes | None) -> None:
     enc = serialization.BestAvailableEncryption(pw) if pw else serialization.NoEncryption()
     pem = key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -45,11 +162,16 @@ def _save_private(path: Path, key: Any) -> None:
 
 
 def _load_private(path: Path) -> Any:
+    pem = path.read_bytes()
+    # Only an encrypted key needs a passphrase; an unencrypted one loads as is,
+    # so a configured passphrase does not break keys made before it was set.
+    pw = _passphrase() if key_pem_is_encrypted(pem) else None
     try:
-        return serialization.load_pem_private_key(path.read_bytes(), password=_passphrase())
-    except TypeError as e:  # encrypted key without passphrase, or vice versa
+        return serialization.load_pem_private_key(pem, password=pw)
+    except TypeError as e:  # encrypted key without passphrase
         raise CryptoError(
-            f"Cannot load {path.name}: set AIIT_KEY_PASSPHRASE to the passphrase used at init"
+            f"Cannot load {path.name}: it is encrypted; set {PASSPHRASE_ENV} or {PASSPHRASE_FILE_ENV} "
+            f"to the passphrase used at init"
         ) from e
     except ValueError as e:
         raise CryptoError(f"Cannot load {path.name}: wrong passphrase or corrupt key") from e
@@ -59,6 +181,61 @@ def pub_hex(key: Any) -> str:
     return key.public_bytes(
         encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
     ).hex()
+
+
+# ---------------------------------------------------------------- fingerprints
+
+def public_key_bytes(value: Any) -> bytes:
+    """Raw 32 public-key bytes from a key object, raw bytes, hex (as stored in identity and
+    enrollment files) or base64 (standard or URL-safe, padded or not). ValueError otherwise."""
+    if hasattr(value, "public_key") and not hasattr(value, "public_bytes"):
+        value = value.public_key()
+    if hasattr(value, "public_bytes"):
+        raw = value.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+    elif isinstance(value, str):
+        s = "".join(value.split())
+        if re.fullmatch(r"[0-9a-fA-F]{64}", s):
+            raw = bytes.fromhex(s)
+        else:
+            try:
+                padded = s + "=" * (-len(s) % 4)
+                raw = base64.b64decode(padded, validate=True) if not re.search(r"[-_]", s) else base64.urlsafe_b64decode(padded)
+            except (ValueError, TypeError) as e:
+                raise ValueError("public key must be raw bytes, hex or base64") from e
+    else:
+        raise ValueError(f"cannot take a public key from {type(value).__name__}")
+    if len(raw) != RAW_PUBLIC_KEY_LEN:
+        raise ValueError(f"public key must be {RAW_PUBLIC_KEY_LEN} bytes, got {len(raw)}")
+    return raw
+
+
+def fingerprint(public_key: Any) -> str:
+    """SHA-256 of the raw public key as 16 blocks of 4 hex digits (``a1b2 c3d4 ...``).
+
+    The same key gives the same string on every platform; it is what an
+    operator reads out at ``init`` and types at ``enroll --fingerprint``.
+    """
+    digest = hashlib.sha256(public_key_bytes(public_key)).hexdigest()
+    return " ".join(digest[i:i + 4] for i in range(0, len(digest), 4))
+
+
+def _normalize_fingerprint(text: str) -> str | None:
+    s = str(text).strip().lower()
+    if s.startswith("sha256:"):
+        s = s[len("sha256:"):]
+    s = re.sub(r"[\s:\-]", "", s)
+    return s if re.fullmatch(r"[0-9a-f]{64}", s) else None
+
+
+def fingerprint_matches(given: str, actual: str) -> bool:
+    """Compare a typed or pasted fingerprint with the real one, ignoring case, spaces, colons and
+    dashes (and a ``sha256:`` prefix); a malformed or partial value never matches."""
+    g, a = _normalize_fingerprint(given), _normalize_fingerprint(actual)
+    if g is None or a is None:
+        return False
+    return hmac.compare_digest(g.encode("ascii"), a.encode("ascii"))
 
 
 def ed25519_pub_from_hex(h: str) -> ed25519.Ed25519PublicKey:
@@ -88,6 +265,11 @@ class Identity:
     def sign(self, data: bytes) -> str:
         return self.sign_priv.sign(data).hex()
 
+    @property
+    def fingerprint(self) -> str:
+        """Fingerprint of the signing public key, the value peers pin."""
+        return fingerprint(self.sign_priv.public_key())
+
     # -- persistence
     @classmethod
     def generate(cls, id: str, with_box: bool) -> "Identity":
@@ -99,9 +281,10 @@ class Identity:
 
     def save(self, keys_dir: Path) -> None:
         keys_dir.mkdir(parents=True, exist_ok=True)
-        _save_private(keys_dir / "sign.key", self.sign_priv)
+        pw = _passphrase(confirm=True)
+        _save_private(keys_dir / "sign.key", self.sign_priv, pw)
         if self.box_priv is not None:
-            _save_private(keys_dir / "box.key", self.box_priv)
+            _save_private(keys_dir / "box.key", self.box_priv, pw)
         meta = {"id": self.id, "sign_pub": self.sign_pub_hex, "box_pub": self.box_pub_hex}
         write_json(keys_dir / "identity.json", meta, private=True)
 

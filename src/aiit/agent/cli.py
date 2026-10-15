@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import platform
 import shutil
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -13,17 +15,18 @@ from typing import Any
 from pydantic import ValidationError
 
 from .. import __version__
+from ..common import term
 from ..common.bundle import pack_dir, write_bundle
-from ..common.crypto import CryptoError
+from ..common.crypto import CryptoError, fingerprint, fingerprint_matches, set_passphrase_prompt
 from ..common.net import HttpStatusError, NetError, http_json
 from ..common.policy import Policy
 from ..common.schema import BundleManifest, Enrollment, SignedPlan
 from ..common.util import current_os, hostname, iso, new_id, os_version, read_json, safe_join, validate_id, write_json
-from .collectors import collect_all
+from .collectors import FAILURE_STATUSES, collect_all, collector_table_sha256, is_elevated, selftest_rows, status_counts
 from .executor import apply_plan, load_signed_plan, preflight, verify_signed_plan
 from .state import AgentState
 
-EXIT_USAGE, EXIT_NETWORK, EXIT_VERIFY, EXIT_POLICY = 2, 3, 4, 5
+EXIT_USAGE, EXIT_NETWORK, EXIT_VERIFY, EXIT_POLICY, EXIT_INTERRUPT = 2, 3, 4, 5, 130
 
 
 def _state(args: argparse.Namespace) -> AgentState:
@@ -61,39 +64,177 @@ def cmd_enroll(args: argparse.Namespace) -> None:
         sys.exit(f"{args.enrollment} is not a valid enrollment file: {type(e).__name__}")
     if st.is_enrolled() and not args.force:
         sys.exit(f"Already enrolled with console {st.enrollment().console_id}. Use --force to re-enroll.")
+    # The enrollment file is the trust anchor for every plan this endpoint will ever run, so
+    # its key is confirmed out of band: by a fingerprint the operator passes on the command
+    # line, or by reading it back and typing ENROLL. --yes is for lab scripts only.
+    fp = fingerprint(enr.console_sign_pub)
+    if args.fingerprint:
+        if not fingerprint_matches(args.fingerprint, fp):
+            sys.exit("console key fingerprint mismatch; not enrolling (the enrollment file may have been swapped)\n"
+                     f"  file:  {fp}\n  given: {args.fingerprint.strip()}")
+    elif not args.yes:
+        print(f"Console {enr.console_id} signing key fingerprint:\n  {fp}")
+        print("Compare it with what `aiit-console init` printed on the operator machine (or ask the operator).")
+        answer = input("Type ENROLL to trust this console: ")
+        if answer.strip() != "ENROLL":
+            sys.exit("Not enrolled.")
     ident = st.enroll(enr)
     print(f"Enrolled. agent_id={ident.id} console_id={enr.console_id}")
+    print(f"Console key fingerprint: {fp}")
+    print(f"This agent's key fingerprint: {st.identity_fingerprint()}")
     print(f"State dir: {st.root}")
     pol = st.policy()
     print(f"Policy: {st.policy_file} (mode={pol.mode}, max_risk={pol.max_risk}, digest={pol.digest()[:12]})")
+
+
+def _seal_diagnostics(st: AgentState, root: Path, files: list, bundle_id: str, out: Path, *, quick: bool,
+                      issue: str = "", case_id: str | None = None) -> Path:
+    """Write the manifest into ``root`` (the collection directory) and seal it to the enrolled console.
+
+    Besides the collected files the manifest records what a field tester
+    needs to interpret failures: whether the agent was elevated, the policy
+    digest and mode, whether the agent is a frozen executable, and which
+    collector set and table produced the bundle.
+    """
+    ident = st.identity()
+    enr = st.enrollment()
+    os_name = current_os()
+    pol = st.policy()
+    manifest = BundleManifest(
+        bundle_id=bundle_id, agent_id=ident.id, hostname=hostname(), platform=os_name,
+        os_version=os_version(), collected_at=iso(), aiit_version=__version__,
+        issue_description=issue, case_id=case_id, files=files, audit_head=st.audit.head(),
+        elevated=is_elevated(), policy_sha256=pol.digest(), policy_mode=pol.mode,
+        aiit_frozen=bool(getattr(sys, "frozen", False)), collector_set="quick" if quick else "full",
+        collector_table_sha256=collector_table_sha256(os_name),
+    )
+    write_json(root / "manifest.json", manifest.model_dump())
+    plaintext = pack_dir(root)
+    write_bundle(out, plaintext, enr.console_box_pub, ident, kind="diagnostics", bundle_id=bundle_id, console_id=enr.console_id)
+    return out
+
+
+def _status_summary(files: list) -> str:
+    return " ".join(f"{k}={v}" for k, v in status_counts(files).items())
 
 
 def cmd_collect(args: argparse.Namespace) -> None:
     st = _state(args)
     _require_enrolled(st)
     ident = st.identity()
-    enr = st.enrollment()
     os_name = current_os()
     bundle_id = new_id("b-")
+    out = Path(args.out) if args.out else st.outbox / f"{hostname()}-{bundle_id}.aiit"
     with tempfile.TemporaryDirectory(prefix="aiit-collect-") as tmp:
         root = Path(tmp)
         print(f"Collecting diagnostics ({os_name}, {'quick' if args.quick else 'full'})...")
         files = collect_all(root, quick=args.quick, progress=lambda n: print(f"  - {n}"), include_osquery=not args.no_osquery)
-        manifest = BundleManifest(
-            bundle_id=bundle_id, agent_id=ident.id, hostname=hostname(), platform=os_name,
-            os_version=os_version(), collected_at=iso(), aiit_version=__version__,
-            issue_description=args.issue or "", case_id=args.case, files=files, audit_head=st.audit.head(),
-        )
-        write_json(root / "manifest.json", manifest.model_dump())
-        plaintext = pack_dir(root)
-    out = Path(args.out) if args.out else st.outbox / f"{hostname()}-{bundle_id}.aiit"
-    write_bundle(out, plaintext, enr.console_box_pub, ident, kind="diagnostics", bundle_id=bundle_id, console_id=enr.console_id)
-    st.audit.record("collect", bundle_id=bundle_id, files=len(files), errors=sum(1 for f in files if f.error), out=str(out), quick=args.quick)
+        _seal_diagnostics(st, root, files, bundle_id, out, quick=args.quick, issue=args.issue or "", case_id=args.case)
+    errors = sum(1 for f in files if f.error)
+    st.audit.record("collect", bundle_id=bundle_id, files=len(files), errors=errors, out=str(out), quick=args.quick,
+                    statuses=status_counts(files))
     st.audit.checkpoint(ident)
-    print(f"Wrote {out} ({out.stat().st_size} bytes, {len(files)} files, {sum(1 for f in files if f.error)} collector errors)")
+    print(f"Wrote {out} ({out.stat().st_size} bytes, {len(files)} files, {errors} collector errors; {_status_summary(files)})")
     print(f"Hand this file to the console: aiit-console ingest {out.name}")
     if args.push and not _push_file(st, out, args.push, args.token):
         sys.exit(EXIT_NETWORK)
+
+
+# ------------------------------------------------------------------ selftest
+
+def _selftest_report(files: list, os_name: str, quick: bool) -> dict[str, Any]:
+    """Metadata-only report of one collector run. No hostname, no command lines, no output."""
+    rows = selftest_rows(files, os_name)
+    counts = status_counts(files)
+    return {
+        "report": "aiit-agent selftest",
+        "aiit_version": __version__,
+        "aiit_frozen": bool(getattr(sys, "frozen", False)),
+        "platform": os_name,
+        "os_version": os_version(),
+        "python": platform.python_version(),
+        "elevated": is_elevated(),
+        "collector_set": "quick" if quick else "full",
+        "collector_table_sha256": collector_table_sha256(os_name),
+        "generated_at": iso(),
+        "total": len(rows),
+        "failures": sum(counts.get(s, 0) for s in FAILURE_STATUSES),
+        "summary": counts,
+        "collectors": rows,
+    }
+
+
+def _yes_no(v: Any) -> str:
+    return "unknown" if v is None else ("yes" if v else "no")
+
+
+def _selftest_markdown(rep: dict[str, Any]) -> str:
+    lines = [
+        "## aiit-agent selftest", "",
+        "| field | value |", "|---|---|",
+        f"| aiit | {rep['aiit_version']} (frozen: {_yes_no(rep['aiit_frozen'])}) |",
+        f"| platform | {rep['platform']}, {rep['os_version']} |",
+        f"| python | {rep['python']} |",
+        f"| elevated | {_yes_no(rep['elevated'])} |",
+        f"| collector set | {rep['collector_set']} (table {rep['collector_table_sha256'][:12]}) |",
+        f"| generated | {rep['generated_at']} |",
+        "",
+        f"**{rep['total']} collectors, {rep['failures']} failed**: " + ", ".join(f"{v} {k}" for k, v in rep["summary"].items()),
+        "",
+        "| collector | admin | status | exit | ms | bytes | stderr bytes | error class |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for r in rep["collectors"]:
+        lines.append(f"| {r['category']}/{r['name']} | {'yes' if r['requires_admin'] else ''} | {r['status']} | "
+                     f"{'' if r['exit_code'] is None else r['exit_code']} | {r['duration_ms']} | {r['size']} | {r['stderr_size']} | "
+                     f"{r['error_class'] or ''} |")
+    return "\n".join(lines) + "\n"
+
+
+def _selftest_text(rep: dict[str, Any]) -> str:
+    lines = [
+        f"aiit-agent {rep['aiit_version']} selftest  platform={rep['platform']}  python={rep['python']}  "
+        f"elevated={_yes_no(rep['elevated'])}  frozen={_yes_no(rep['aiit_frozen'])}  set={rep['collector_set']}",
+        f"os: {rep['os_version']}", "",
+        f"{'collector':34} {'admin':5} {'status':12} {'exit':>5} {'ms':>7} {'bytes':>9} {'stderr':>7}  error class",
+    ]
+    for r in rep["collectors"]:
+        lines.append(f"{r['category'] + '/' + r['name']:34} {'yes' if r['requires_admin'] else '':5} {term.status_label(r['status'], 12)} "
+                     f"{'' if r['exit_code'] is None else r['exit_code']:>5} {r['duration_ms']:>7} {r['size']:>9} {r['stderr_size']:>7}  "
+                     f"{r['error_class'] or ''}")
+    lines.append("")
+    lines.append(f"{rep['total']} collectors, {rep['failures']} failed: " + ", ".join(f"{v} {k}" for k, v in rep["summary"].items()))
+    return "\n".join(lines) + "\n"
+
+
+def cmd_selftest(args: argparse.Namespace) -> None:
+    """Run every collector for this OS and report metadata only (for field testing and bug reports)."""
+    st = _state(args)
+    if args.seal:
+        _require_enrolled(st)
+    os_name = current_os()
+    quick = not args.full
+    sealed: Path | None = None
+    with tempfile.TemporaryDirectory(prefix="aiit-selftest-") as tmp:
+        root = Path(tmp)
+        print(f"Running {'quick' if quick else 'full'} collector set for {os_name}...", file=sys.stderr)
+        files = collect_all(root, quick=quick, progress=lambda n: print(f"  - {n}", file=sys.stderr), include_osquery=not args.no_osquery)
+        if args.seal:
+            bundle_id = new_id("b-")
+            sealed = _seal_diagnostics(st, root, files, bundle_id, Path(args.seal), quick=quick, issue="aiit-agent selftest")
+            st.audit.record("selftest", bundle_id=bundle_id, files=len(files), statuses=status_counts(files), out=str(sealed))
+            st.audit.checkpoint(st.identity())
+    rep = _selftest_report(files, os_name, quick)
+    if args.json:
+        print(json.dumps(rep, indent=2))
+    elif args.markdown:
+        print(_selftest_markdown(rep), end="")
+    else:
+        print(_selftest_text(rep), end="")
+    if sealed:
+        print(f"Sealed bundle of this run: {sealed} (hand it to the console: aiit-console ingest {sealed.name})", file=sys.stderr)
+    if args.strict and rep["failures"]:
+        sys.exit(1)
 
 
 def _push_file(st: AgentState, path: Path, server: str, token: str | None) -> bool:
@@ -314,23 +455,43 @@ def cmd_apply(args: argparse.Namespace) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     st = _state(args)
-    print(f"aiit-agent {__version__}  state={st.root}")
     if not st.is_enrolled():
-        print("Not enrolled.")
+        if args.json:
+            print(json.dumps({"aiit_version": __version__, "state_dir": str(st.root), "enrolled": False}, indent=2))
+        else:
+            print(f"aiit-agent {__version__}  state={st.root}")
+            print("Not enrolled.")
         return
     ident = st.identity()
     enr = st.enrollment()
     pol = st.policy()
+    marker = st.applying()
+    ok, msg = st.audit.verify(expected_pub=ident.sign_pub_hex)
+    if args.json:
+        print(json.dumps({
+            "aiit_version": __version__, "state_dir": str(st.root), "enrolled": True,
+            "agent_id": ident.id, "agent_fingerprint": st.identity_fingerprint(), "hostname": hostname(), "os": current_os(),
+            "console_id": enr.console_id, "console_fingerprint": st.console_fingerprint(),
+            "policy": {"mode": pol.mode, "max_risk": pol.max_risk, "max_plan_hours": pol.max_plan_hours,
+                       "deny_patterns": len(pol.deny_patterns), "allow_patterns": len(pol.allow_patterns), "digest": pol.digest()},
+            "applied_plans": len(st.applied_plan_ids()),
+            "interrupted_run": marker,
+            "audit": {"ok": ok, "detail": msg, "head": st.audit.head()},
+        }, indent=2))
+        return
+    print(f"aiit-agent {__version__}  state={st.root}")
     print(f"agent_id={ident.id}  host={hostname()}  os={current_os()}")
-    print(f"console_id={enr.console_id}  console_sign_pub={enr.console_sign_pub[:16]}...")
+    print(f"agent key fingerprint:   {st.identity_fingerprint()}")
+    print(f"console_id={enr.console_id}")
+    print(f"console key fingerprint: {st.console_fingerprint()}")
     print(f"policy: mode={pol.mode} max_risk={pol.max_risk} max_plan_hours={pol.max_plan_hours} deny_patterns={len(pol.deny_patterns)} "
           f"allow_patterns={len(pol.allow_patterns)} digest={pol.digest()[:16]}")
     print(f"applied plans: {len(st.applied_plan_ids())}")
-    marker = st.applying()
     if marker:
-        print(f"INTERRUPTED enforce run: plan {marker.get('plan_id')} (completed {len(marker.get('completed', []))} step(s)); use apply --resume")
-    ok, msg = st.audit.verify(expected_pub=ident.sign_pub_hex)
-    print(f"audit chain: {'OK' if ok else 'BROKEN'} ({msg})")
+        print(term.paint(f"INTERRUPTED enforce run: plan {marker.get('plan_id')} (completed {len(marker.get('completed', []))} step(s)); "
+                         "use apply --resume", "yellow", "bold"))
+    verdict = term.paint("OK", "green") if ok else term.paint("BROKEN", "red", "bold")
+    print(f"audit chain: {verdict} ({msg})")
 
 
 def cmd_policy(args: argparse.Namespace) -> None:
@@ -391,11 +552,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="aiit-agent", description="AI_IT endpoint agent")
     p.add_argument("--data-dir", help="state directory (default: AIIT_AGENT_DIR or ~/.aiit/agent)")
     p.add_argument("--debug", action="store_true", help="show tracebacks")
+    p.add_argument("--no-color", action="store_true", help="plain output (also NO_COLOR=1)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("enroll", help="trust a console using its public enrollment file")
     s.add_argument("enrollment")
     s.add_argument("--force", action="store_true")
+    s.add_argument("--fingerprint", metavar="FP", help="the console key fingerprint printed by `aiit-console init`; enrollment is refused on a mismatch")
+    s.add_argument("--yes", action="store_true", help="skip the typed ENROLL confirmation (lab scripts only; prefer --fingerprint)")
     s.set_defaults(func=cmd_enroll)
 
     s = sub.add_parser("collect", help="collect diagnostics into an encrypted bundle")
@@ -407,6 +571,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--push", metavar="URL", help="also upload to a console server (LAN mode)")
     s.add_argument("--token", help="server token (prefer AIIT_SERVER_TOKEN or AIIT_SERVER_TOKEN_FILE)")
     s.set_defaults(func=cmd_collect)
+
+    s = sub.add_parser("selftest", help="run every collector for this OS and print per-collector metadata only (no content, no hostname)")
+    s.add_argument("--full", action="store_true", help="run the full set instead of the quick set")
+    s.add_argument("--no-osquery", action="store_true")
+    fmt = s.add_mutually_exclusive_group()
+    fmt.add_argument("--json", action="store_true", help="machine readable report on stdout")
+    fmt.add_argument("--markdown", action="store_true", help="report ready to paste into a GitHub issue")
+    s.add_argument("--seal", metavar="OUT", help="also write a normal sealed bundle of the same run for the console (needs enrollment)")
+    s.add_argument("--strict", action="store_true",
+                   help=f"exit 1 when any collector is {', '.join(FAILURE_STATUSES)} (default: exit 0, it is a report)")
+    s.set_defaults(func=cmd_selftest)
 
     s = sub.add_parser("push", help="upload a bundle or report to a console server (LAN mode)")
     s.add_argument("file", nargs="?", help="a .aiit file")
@@ -434,6 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_pull)
 
     s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true", help="machine readable status on stdout")
     s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("policy", help="show or change the local execution policy")
@@ -464,32 +640,59 @@ def main(argv: list[str] | None = None) -> None:
         with contextlib.suppress(AttributeError, ValueError, OSError):
             stream.reconfigure(errors="replace")
     args = build_parser().parse_args(argv)
-    if args.cmd not in ("enroll",):
-        try:
-            st = AgentState(Path(args.data_dir) if args.data_dir else None)
-            if st.is_enrolled():
-                st.audit.check_and_alert(expected_pub=st.public_sign_key())
-        except Exception as e:  # pragma: no cover - the check must never block the command
-            if args.debug:
-                raise
-            print(f"warning: audit check skipped: {type(e).__name__}", file=sys.stderr)
+    if args.no_color:
+        term.set_color(False)
+    set_passphrase_prompt(True)  # an encrypted key with no AIIT_KEY_PASSPHRASE* set asks on the terminal
     try:
+        if args.cmd not in ("enroll",):
+            try:
+                st = AgentState(Path(args.data_dir) if args.data_dir else None)
+                if st.is_enrolled():
+                    st.audit.check_and_alert(expected_pub=st.public_sign_key())
+            except PermissionError:
+                raise  # a refused state directory is the command's error, reported below
+            except Exception as e:  # pragma: no cover - the check must never block the command
+                if args.debug:
+                    raise
+                print(f"warning: audit check skipped: {type(e).__name__}", file=sys.stderr)
         args.func(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(EXIT_INTERRUPT)
+    except EOFError:
+        term.report_error("no answer on stdin (not a terminal?)", "run interactively, or pass --yes where the command supports it")
+        sys.exit(EXIT_USAGE)
     except CryptoError as e:
         if args.debug:
             raise
-        print(f"error: {e}", file=sys.stderr)
+        term.report_error(str(e), "the plan or enrollment file may be for another console, tampered, or sealed with a newer version")
         sys.exit(EXIT_VERIFY)
     except NetError as e:
         if args.debug:
             raise
-        print(f"network error: {e}", file=sys.stderr)
+        term.report_error(str(e), "the bundle is kept locally; retry with `aiit-agent push --outbox` once the console is reachable",
+                          label="network error")
         sys.exit(EXIT_NETWORK)
+    except tarfile.TarError as e:
+        if args.debug:
+            raise
+        term.report_error(f"archive is damaged: {e}", "fetch the plan again from the console")
+        sys.exit(EXIT_VERIFY)
+    except PermissionError as e:
+        if args.debug:
+            raise
+        term.report_error(str(e), "fix the state directory as shown, or set AIIT_ALLOW_LOOSE_STATE_DIR=1 to continue with a warning")
+        sys.exit(EXIT_USAGE)
     except (ValidationError, ValueError, FileNotFoundError) as e:
         if args.debug:
             raise
-        print(f"error: {str(e).splitlines()[0][:300]}", file=sys.stderr)
+        term.report_error(str(e), "run with --debug for the full traceback")
         sys.exit(EXIT_USAGE)
+    except OSError as e:
+        if args.debug:
+            raise
+        term.report_error(f"{type(e).__name__}: {e}", "check disk space and permissions on the agent state directory")
+        sys.exit(1)
 
 
 if __name__ == "__main__":  # pragma: no cover

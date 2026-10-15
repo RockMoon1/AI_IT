@@ -198,7 +198,26 @@ provider records `hosted` (data leaves the operator machine) and
   400 degrades once to the plain Messages call, and `AIIT_HIPAA_MODE=1`
   disables beta features so the request stays on the BAA-covered surface.
   `stop_reason` `refusal` is a hard stop (`ProviderRefusal`), never retried.
-  Always `hosted`; from PR 2 it requires `AIIT_ALLOW_HOSTED=1`.
+  Always `hosted`, so it needs `--allow-hosted` or `AIIT_ALLOW_HOSTED=1`.
+* `openai`, `azure-openai`, `openai-compat` and the local presets `llamacpp`,
+  `vllm`, `lmstudio`: one class over the chat-completions wire format through
+  `aiit.common.net.http_json` (no SDK). Strict JSON-schema output is requested
+  first and degrades once to `json_object`, then to free text, on a 400 that
+  names the format; `finish_reason` `length` is an error, `refusal` and
+  `content_filter` are `ProviderRefusal`. Keys come from `AIIT_OPENAI_API_KEY`,
+  `AZURE_OPENAI_API_KEY` (Azure) or `OPENAI_API_KEY`, are sent only as a
+  header and never reach the audit log; `AIIT_OPENAI_BASE_URL`,
+  `AIIT_OPENAI_MODEL`, `AIIT_AZURE_OPENAI_DEPLOYMENT`,
+  `AIIT_AZURE_OPENAI_API_VERSION`. `openai` and `azure-openai` are always
+  `hosted`; a compat server is `hosted` only when its URL is not loopback or
+  private. Bedrock and Vertex are out of scope (reachable later through the
+  Anthropic SDK's clients).
+
+Hosted providers are refused unless the operator passes `--allow-hosted`
+or sets `AIIT_ALLOW_HOSTED=1`, the HIPAA-safe default. `diagnose --fallback`
+names a second provider to try when the first fails; it may only move
+towards more privacy (hosted -> local -> `dryrun`), and the switch is
+audited as `llm_fallback`. Nothing falls back automatically.
 
 Errors are one hierarchy: `ProviderError` (transport, timeout, HTTP status,
 truncation), `ProviderRefusal` (the model declined) and
@@ -253,7 +272,48 @@ are passed through the case's redactor before they enter the prompt.
   MeshCentral (Apache-2.0) for screen, terminal and files. AI_IT does not
   replace that; it feeds it.
 
-## 8. Threats considered
+## 8. Read-only dashboard
+
+`aiit-console dashboard` (module `aiit.console.dashboard`) serves one
+self-contained HTML page over the console directory so an operator can keep a
+browser tab open while working in the terminal: the cases table (id, created,
+hostname token, platform, agent, trust state, plan and report counts, last
+activity), one page per case with every plan (steps, risk colouring, lint
+warnings, approval state) and every execution report (per-step status, exit
+code, reason), the enrolled agents with their last-seen time and witnessed
+audit head, the console id, and the audit chain verdict with the signed
+checkpoint seq. The page refreshes itself every 15 s with a `<meta>` tag.
+
+Its trust boundary is deliberately narrow:
+
+* **Loopback only.** `make_dashboard_server` binds to `127.0.0.1` or `::1`
+  and raises `ValueError` for any other host, including `localhost` (a hosts
+  file can point that anywhere). There is no authentication: whoever can
+  reach the port is already the operator at this machine, the same person who
+  can run the CLI against the same directory. Putting it behind a reverse
+  proxy or an SSH tunnel is outside the design; the full console in
+  `docs/roadmap.md` is the answer for remote or multi-operator use.
+* **Nothing writes.** Only `GET` and `HEAD` are served; every other method is
+  `405`. The audit chain is checked with `AuditLog.verify`, never with
+  `check_and_alert`, so a page load neither appends an `audit_chain_broken`
+  entry nor fires the alert sinks, and no file under the console directory is
+  created or modified. `tests/test_dashboard.py` asserts that the log and the
+  checkpoint are byte-identical after a series of requests.
+* **Nothing executes.** The page carries no script; its
+  `Content-Security-Policy` is `default-src 'none'; style-src 'unsafe-inline'`,
+  with `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  `Cache-Control: no-store` and `X-Frame-Options: DENY` on every response.
+  Every value that came from a bundle, a model answer or an operator (ids,
+  hostnames, commands, titles, rationales, reasons) passes through
+  `html.escape`. Raw collected files and command output are never rendered;
+  where a redacted form exists (the hostname token, the issue text) the page
+  shows that form.
+* **Same data as the CLI.** The page is built from `ConsoleState.list_cases`,
+  `ConsoleState.agents`, `planner.load_plan` and the case's `reports/` entries,
+  the same helpers behind `cases`, `plans`, `plan`, `report` and `agents`, so
+  it cannot disagree with the terminal.
+
+## 9. Threats considered
 
 The threat model lives in `docs/security/threat-model.md`. It is organised
 by STRIDE and lists, for every threat, the control, the file and function

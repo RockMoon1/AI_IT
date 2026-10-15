@@ -367,3 +367,134 @@ class DotenvTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProviderGateAndFallbackTests(ConsoleCliBase):
+    """D1: hosted providers need an explicit opt-in; a fallback may only move towards more privacy."""
+
+    def _fake_anthropic(self):
+        from tests.test_planner_providers import _fake_anthropic
+        mod, calls = _fake_anthropic()
+        for patcher in (mock.patch.dict(sys.modules, {"anthropic": mod}),
+                        mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-" + "x" * 24})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return calls
+
+    def test_hosted_provider_is_refused_without_opt_in(self):
+        case_id = self.ingest()
+        calls = self._fake_anthropic()
+        os.environ.pop("AIIT_ALLOW_HOSTED", None)
+        code, out = self.console_exit("diagnose", case_id, "--provider", "anthropic")
+        self.assertIn("--allow-hosted", out)
+        self.assertIn("api.anthropic.com", out)
+        self.assertEqual(calls["beta"] + calls["plain"], 0, "no request may leave the machine before the opt-in")
+        self.assertEqual(json.loads(self.console("plans", case_id, "--json")), [])
+
+    def test_hosted_provider_runs_with_flag_or_env(self):
+        case_id = self.ingest()
+        calls = self._fake_anthropic()
+        self.console("diagnose", case_id, "--provider", "anthropic", "--allow-hosted")
+        first = calls["beta"] + calls["plain"]
+        self.assertGreater(first, 0)
+        with mock.patch.dict(os.environ, {"AIIT_ALLOW_HOSTED": "1"}):
+            self.console("diagnose", case_id, "--provider", "anthropic")
+        self.assertGreater(calls["beta"] + calls["plain"], first)
+        self.assertEqual(len(json.loads(self.console("plans", case_id, "--json"))), 2)
+
+    def test_fallback_must_be_at_least_as_private(self):
+        case_id = self.ingest()
+        code, out = self.console_exit("diagnose", case_id, "--provider", "dryrun", "--fallback", "ollama")
+        self.assertIn("less private", out)
+        self.assertEqual(json.loads(self.console("plans", case_id, "--json")), [])
+
+    def test_fallback_to_dryrun_after_a_provider_failure_is_audited(self):
+        case_id = self.ingest()
+        srv = helpers.FakeHTTP().start()
+        self.addCleanup(srv.stop)
+        srv.queue(500, {"error": "boom"}).queue(500, {"error": "boom"}).queue(500, {"error": "boom"})
+        with mock.patch("aiit.common.net._sleep", lambda s: None), \
+             mock.patch.dict(os.environ, {"AIIT_OLLAMA_URL": srv.url, "AIIT_PLAN_REPAIRS": "0"}):
+            out = self.console("diagnose", case_id, "--provider", "ollama", "--fallback", "dryrun")
+        self.assertIn("falling back to dryrun", out)
+        self.assertIn("fallback provider dryrun", out)
+        plans = json.loads(self.console("plans", case_id, "--json"))
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["provider"], "dryrun")
+        actions = [e["action"] for e in self.state.audit.entries()]
+        self.assertIn("llm_fallback", actions)
+        fb = [e for e in self.state.audit.entries() if e["action"] == "llm_fallback"][0]["details"]
+        self.assertEqual((fb["from_provider"], fb["to_provider"]), ("ollama", "dryrun"))
+
+    def test_provider_failure_without_fallback_hints_at_one(self):
+        case_id = self.ingest()
+        srv = helpers.FakeHTTP().start()
+        self.addCleanup(srv.stop)
+        for _ in range(4):
+            srv.queue(500, {"error": "boom"})
+        with mock.patch("aiit.common.net._sleep", lambda s: None), \
+             mock.patch.dict(os.environ, {"AIIT_OLLAMA_URL": srv.url, "AIIT_PLAN_REPAIRS": "0"}):
+            code, out = self.console_exit("diagnose", case_id, "--provider", "ollama")
+        self.assertEqual(code, 3)
+        self.assertIn("--fallback dryrun", out)
+
+
+class OutputAndErrorSurfaceTests(ConsoleCliBase):
+    """D3/D4: machine-readable output on request, one coloured line (never a traceback) on failure."""
+
+    def test_report_json_and_no_color(self):
+        case_id = self.ingest()
+        plan_id = self.diagnose(case_id)
+        self.console("approve", case_id, plan_id, "--yes")
+        plan = self.signed_plan(case_id, plan_id)
+        results = [{"step_id": s["id"], "title": s["title"], "command": s.get("command"), "status": "dry_run", "reason": "policy mode is dry_run"}
+                   for s in plan["steps"]]
+        rp = helpers.seal_report(self.state, self.agent, self.root / "r.aiit", case_id, plan_id, results)
+        out = self.console("--no-color", "report", str(rp), "--json")
+        data = json.loads(out[out.index("{"):])
+        self.assertEqual(data["case_id"], case_id)
+        self.assertEqual(data["plan_id"], plan_id)
+        self.assertEqual({r["status"] for r in data["results"]}, {"dry_run"})
+        self.assertNotIn("\x1b[", out)
+
+    def test_interrupt_and_eof_map_to_exit_codes(self):
+        with mock.patch.object(console_cli, "cmd_cases", side_effect=KeyboardInterrupt):
+            code, out = self.console_exit("cases")
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", out)
+        with mock.patch.object(console_cli, "cmd_cases", side_effect=EOFError):
+            code, out = self.console_exit("cases")
+        self.assertEqual(code, 2)
+        self.assertIn("stdin", out)
+
+    def test_os_and_tar_errors_are_one_line_with_a_hint(self):
+        import tarfile
+        with mock.patch.object(console_cli, "cmd_cases", side_effect=tarfile.ReadError("truncated")):
+            code, out = self.console_exit("cases")
+        self.assertEqual(code, 4)
+        self.assertIn("damaged", out)
+        self.assertNotIn("Traceback", out)
+        with mock.patch.object(console_cli, "cmd_cases", side_effect=OSError(28, "No space left on device")):
+            code, out = self.console_exit("cases")
+        self.assertEqual(code, 1)
+        self.assertIn("No space left", out)
+        self.assertIn("hint:", out)
+
+    def test_debug_re_raises(self):
+        with mock.patch.object(console_cli, "cmd_cases", side_effect=OSError(5, "io")):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), self.assertRaises(OSError):
+                console_cli.main(["--data-dir", str(self.cdir), "--debug", "cases"])
+
+
+class DashboardCommandTests(ConsoleCliBase):
+    def test_dashboard_refuses_non_loopback_and_audits_a_run(self):
+        code, out = self.console_exit("dashboard", "--host", "0.0.0.0", "--port", "0")
+        self.assertIn("127.0.0.1", out)
+        from aiit.console import dashboard
+        with mock.patch.object(dashboard.DashboardServer, "serve_forever", side_effect=KeyboardInterrupt):
+            out = self.console("dashboard", "--port", "0")
+        self.assertIn("read-only", out)
+        self.assertIn("http://127.0.0.1:", out)
+        actions = [e["action"] for e in self.state.audit.entries()]
+        self.assertIn("dashboard_start", actions)
+        self.assertEqual(actions[-1], "dashboard_stop")

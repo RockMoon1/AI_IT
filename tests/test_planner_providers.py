@@ -365,3 +365,32 @@ class PlannerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrivacyOrderTests(unittest.TestCase):
+    """D1: hosted egress needs an opt-in and a fallback may only move towards more privacy."""
+
+    def test_privacy_rank_and_gate(self):
+        from aiit.console.planner import check_fallback_more_private, check_hosted_allowed, privacy_rank
+        from aiit.console.llm.base import LLMProvider
+
+        class Local(LLMProvider):
+            name, model, hosted, endpoint_host = "local", "m", False, "127.0.0.1"
+
+        class Hosted(LLMProvider):
+            name, model, hosted, endpoint_host = "cloud", "m", True, "api.example.org"
+
+        dry = get_provider("dryrun")
+        self.assertEqual((privacy_rank(dry), privacy_rank(Local()), privacy_rank(Hosted())), (0, 1, 2))
+        check_hosted_allowed(Local(), False)          # local never needs the switch
+        check_hosted_allowed(Hosted(), True)
+        with self.assertRaises(ProviderError) as cm:
+            check_hosted_allowed(Hosted(), False)
+        self.assertIn("api.example.org", str(cm.exception))
+        self.assertIn("--allow-hosted", str(cm.exception))
+        check_fallback_more_private(Hosted(), Local())
+        check_fallback_more_private(Local(), dry)
+        check_fallback_more_private(Local(), Local())
+        for primary, fb in ((dry, Local()), (Local(), Hosted()), (dry, Hosted())):
+            with self.assertRaises(ProviderError):
+                check_fallback_more_private(primary, fb)

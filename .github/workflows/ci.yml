@@ -51,6 +51,28 @@ jobs:
           path: .coverage.*
           include-hidden-files: true
           if-no-files-found: error
+      # The real collector set, once per OS: a metadata-only report (statuses, timings,
+      # sizes; never content or the hostname) that field testers can compare against.
+      - name: Collector selftest (metadata only)
+        if: matrix.python == '3.12'
+        shell: bash
+        env:
+          AIIT_AGENT_DIR: ${{ runner.temp }}/aiit-agent
+        run: |
+          aiit-agent --no-color selftest --json --no-osquery > "selftest-${{ matrix.os }}.json"
+          python - "selftest-${{ matrix.os }}.json" >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json, sys
+          r = json.load(open(sys.argv[1], encoding="utf-8"))
+          counts = ", ".join(f"{v} {k}" for k, v in r["summary"].items())
+          print(f"**selftest {r['platform']}** (elevated={r['elevated']}): {r['total']} collectors, {r['failures']} failed: {counts}")
+          EOF
+      - name: Upload selftest report
+        if: matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-${{ matrix.os }}
+          path: selftest-*.json
+          if-no-files-found: error
 
   coverage:
     name: Coverage gate

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from ..common.audit import AuditLog
-from ..common.crypto import Identity
+from ..common.crypto import Identity, fingerprint
 from ..common.policy import Policy
 from ..common.schema import Enrollment
 from ..common.util import ensure_private_dir, iso, new_id, read_json, write_json
@@ -24,7 +24,7 @@ def default_agent_dir() -> Path:
 
 class AgentState:
     def __init__(self, root: Path | None = None):
-        self.root = ensure_private_dir(root or default_agent_dir())
+        self.root = ensure_private_dir(root or default_agent_dir(), owner="agent")
         self.keys_dir = self.root / "keys"
         self.console_file = self.root / "console-enrollment.json"
         self.policy_file = self.root / "policy.json"
@@ -45,6 +45,15 @@ class AgentState:
     def public_sign_key(self) -> str | None:
         meta = self.keys_dir / "identity.json"
         return read_json(meta).get("sign_pub") if meta.exists() else None
+
+    def identity_fingerprint(self) -> str | None:
+        """Fingerprint of this agent's signing key (what the console pins), without touching the private key."""
+        pub = self.public_sign_key()
+        return fingerprint(pub) if pub else None
+
+    def console_fingerprint(self) -> str | None:
+        """Fingerprint of the enrolled console's signing key (what the operator read out at ``init``)."""
+        return fingerprint(self.enrollment().console_sign_pub) if self.console_file.exists() else None
 
     def is_enrolled(self) -> bool:
         return (self.keys_dir / "identity.json").exists() and self.console_file.exists()

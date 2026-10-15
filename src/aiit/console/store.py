@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from ..common.audit import AuditLog
 from ..common.bundle import read_bundle, unpack_to
-from ..common.crypto import CryptoError, Identity
+from ..common.crypto import CryptoError, Identity, fingerprint
 from ..common.redact import RedactionConfig, Redactor
 from ..common.schema import BundleManifest, Enrollment, ExecutionReport
 from ..common.util import (ensure_private_dir, file_lock, iso, new_id, read_json, safe_join, sha256_file,
@@ -145,7 +145,7 @@ def _harvest_usernames(raw: Path) -> list[str]:
 
 class ConsoleState:
     def __init__(self, root: Path | None = None):
-        self.root = ensure_private_dir(root or default_console_dir())
+        self.root = ensure_private_dir(root or default_console_dir(), owner="console")
         self.keys_dir = self.root / "keys"
         self.enrollment_file = self.root / "enrollment" / "console-enrollment.json"
         self.agents_file = self.root / "agents.json"
@@ -170,6 +170,11 @@ class ConsoleState:
     def public_sign_key(self) -> str | None:
         meta = self.keys_dir / "identity.json"
         return read_json(meta).get("sign_pub") if meta.exists() else None
+
+    def identity_fingerprint(self) -> str | None:
+        """Fingerprint of the console signing key: printed at ``init``, checked by ``aiit-agent enroll --fingerprint``."""
+        pub = self.public_sign_key()
+        return fingerprint(pub) if pub else None
 
     def init(self, label: str = "") -> Enrollment:
         if self.is_initialized():

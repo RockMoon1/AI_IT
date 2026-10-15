@@ -1,30 +1,58 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# setuptools >= 77 for the PEP 639 license expression below; `wheel` is pulled in by setuptools itself.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiit"
-version = "0.1.0"
+# The version lives in src/aiit/__init__.py (`__version__`), nowhere else; see [tool.setuptools.dynamic].
+dynamic = ["version"]
 description = "AI_IT: open source, HIPAA-minded AI IT support agent and operator console for connected and offline endpoints"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+# PEP 639 license expression (setuptools >= 77). The old `License ::` classifier is deliberately absent:
+# PyPI rejects uploads that carry both the expression and the classifier.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{name = "AI_IT contributors"}]
 keywords = ["rmm", "it-support", "ai", "llm", "hipaa", "air-gapped", "diagnostics"]
 classifiers = [
-  "License :: OSI Approved :: Apache Software License",
-  "Programming Language :: Python :: 3",
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Information Technology",
+  "Intended Audience :: System Administrators",
   "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: System :: Systems Administration",
+  "Topic :: Security",
+  "Typing :: Typed",
 ]
+# Runtime dependencies: the standard library plus these two, nothing else (CONTRIBUTING.md, hard constraint 1).
 dependencies = [
   "cryptography>=42",
   "pydantic>=2.5",
 ]
 
+[project.urls]
+Homepage = "https://github.com/RockMoon1/AI_IT"
+Source = "https://github.com/RockMoon1/AI_IT"
+Issues = "https://github.com/RockMoon1/AI_IT/issues"
+Changelog = "https://github.com/RockMoon1/AI_IT/blob/Main/CHANGELOG.md"
+"Security policy" = "https://github.com/RockMoon1/AI_IT/blob/Main/SECURITY.md"
+Releases = "https://github.com/RockMoon1/AI_IT/releases"
+
 [project.optional-dependencies]
 anthropic = ["anthropic>=1.0"]
 dev = ["pre-commit>=3.5", "coverage[toml]>=7.4", "bandit>=1.7", "pip-audit>=2.7"]
+# Build and release tooling, used only by .github/workflows/release.yml and by a maintainer building
+# binaries locally (packaging/README.md). Never a runtime dependency.
+release = ["build>=1.2", "twine>=6.1", "pyinstaller>=6.11,<7"]
 
 [project.scripts]
 aiit-agent = "aiit.agent.cli:main"
@@ -33,8 +61,14 @@ aiit-console = "aiit.console.cli:main"
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.dynamic]
+version = {attr = "aiit.__version__"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+aiit = ["py.typed"]
 
 [tool.coverage.run]
 source = ["aiit"]

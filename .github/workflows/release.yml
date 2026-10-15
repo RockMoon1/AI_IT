@@ -1,0 +1,400 @@
+name: Release
+
+# Builds and publishes a release when a `v*` tag is pushed. A manual run
+# (workflow_dispatch, on a branch) is a rehearsal: it builds the wheel, the
+# binaries and the wheelhouses and keeps them as workflow artifacts, but
+# publishes nothing. The owner's one-time setup and the release checklist are
+# in docs/release-process.md.
+#
+# Job graph:
+#
+#   dist --+--> binaries   (ubuntu-22.04, windows-latest, macos-14, macos-15-intel)
+#          |                                                           \
+#          +--> wheelhouse (same four runners)  ------------------------+--> release --+--> pypi      (final tags)
+#                                                                                      +--> testpypi  (-rc/-beta/-alpha tags)
+#
+# Third-party actions are pinned to a major tag and bumped by Dependabot;
+# pinning to a commit SHA is a listed follow-up in docs/release-process.md.
+# Every job declares the least permission it needs.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  dist:
+    name: Wheel and sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Tag, __version__ and CHANGELOG agree
+        id: meta
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = "tag" ]; then
+            python packaging/release_notes.py check --tag "$REF_NAME" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "Rehearsal run on $REF_NAME: nothing will be published."
+            python packaging/release_notes.py check | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the wheel and the sdist
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install ".[release]"
+          python -m build
+          python -m twine check --strict dist/*
+          ls -l dist
+          test -f "dist/aiit-${VERSION}-py3-none-any.whl"
+          test -f "dist/aiit-${VERSION}.tar.gz"
+
+      - name: Fresh venv, non-editable install, CLI smoke
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/w && /tmp/w/bin/pip install --quiet dist/*.whl
+          /tmp/w/bin/aiit-agent --help >/dev/null && /tmp/w/bin/aiit-console --help >/dev/null
+          test "$(/tmp/w/bin/aiit-console --version)" = "aiit-console ${VERSION}"
+          /tmp/w/bin/aiit-agent status
+
+      - name: Tests against the installed wheel
+        run: |
+          cd /tmp && AIIT_TEST_INSTALLED=1 /tmp/w/bin/python -m unittest discover -s "$GITHUB_WORKSPACE/tests" -t "$GITHUB_WORKSPACE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  binaries:
+    name: Binaries (${{ matrix.label }})
+    needs: dist
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 on purpose: a PyInstaller binary needs a glibc at least as new as the
+          # build host's, and 22.04 (glibc 2.35) covers Debian 12, RHEL 9 and Ubuntu 22.04+.
+          - { runner: ubuntu-22.04, label: linux-x86_64, archive: tar.gz }
+          - { runner: windows-latest, label: windows-x86_64, archive: zip }
+          - { runner: macos-14, label: macos-arm64, archive: tar.gz }
+          # macos-15-intel is GitHub's x86_64 macOS runner; the macos-13 image was retired in December 2025.
+          - { runner: macos-15-intel, label: macos-x86_64, archive: tar.gz }
+    env:
+      VERSION: ${{ needs.dist.outputs.version }}
+      LABEL: ${{ matrix.label }}
+      ARCHIVE: ${{ matrix.archive }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Install the wheel and PyInstaller
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # The frozen binaries are built from the exact wheel that ships; `[release]` adds pyinstaller.
+          python -m pip install "$(ls dist/aiit-*.whl)[release]"
+          python -c "import aiit, sys; print('aiit', aiit.__version__, 'python', sys.version)"
+          pyinstaller --version
+
+      - name: Build with PyInstaller (one-file and one-folder, both tools)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in agent console; do
+            AIIT_PYI_ONEFILE=1 pyinstaller --clean --noconfirm --log-level WARN \
+              --distpath pyi/onefile --workpath "pyi/build-onefile-$tool" "packaging/aiit-$tool.spec"
+            AIIT_PYI_ONEFILE=0 pyinstaller --clean --noconfirm --log-level WARN \
+              --distpath pyi/onedir --workpath "pyi/build-onedir-$tool" "packaging/aiit-$tool.spec"
+          done
+          ls -l pyi/onefile pyi/onedir
+
+      - name: Smoke test (dry-run loop with the frozen binaries, both layouts)
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXT=""
+          if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
+          for layout in onefile onedir; do
+            if [ "$layout" = "onefile" ]; then
+              AGENT="pyi/onefile/aiit-agent$EXT"; CONSOLE="pyi/onefile/aiit-console$EXT"
+            else
+              AGENT="pyi/onedir/aiit-agent/aiit-agent$EXT"; CONSOLE="pyi/onedir/aiit-console/aiit-console$EXT"
+            fi
+            echo "::group::smoke ($layout)"
+            rm -rf smoke && mkdir -p smoke/usb
+            test "$("$CONSOLE" --version)" = "aiit-console ${VERSION}"
+            "$CONSOLE" --data-dir smoke/console init --label release-smoke
+            "$AGENT" --data-dir smoke/agent enroll smoke/console/enrollment/console-enrollment.json
+            "$AGENT" --data-dir smoke/agent status | grep -F "aiit-agent ${VERSION}"
+            "$AGENT" --data-dir smoke/agent collect --quick --no-osquery --issue "release smoke test" --out smoke/usb/case.aiit
+            "$CONSOLE" --data-dir smoke/console ingest smoke/usb/case.aiit
+            CASE="$("$CONSOLE" --data-dir smoke/console cases --json | python -c 'import json, sys; print(json.load(sys.stdin)[0]["case_id"])')"
+            "$CONSOLE" --data-dir smoke/console diagnose "$CASE" --provider dryrun --issue "release smoke test"
+            PLAN="$("$CONSOLE" --data-dir smoke/console plans "$CASE" --json | python -c 'import json, sys; print(json.load(sys.stdin)[0]["plan_id"])')"
+            "$CONSOLE" --data-dir smoke/console approve "$CASE" "$PLAN" --yes --out smoke/usb
+            "$AGENT" --data-dir smoke/agent apply "smoke/usb/$PLAN.signed.json" --dry-run --yes --out smoke/usb/report.aiit
+            "$CONSOLE" --data-dir smoke/console report smoke/usb/report.aiit
+            "$CONSOLE" --data-dir smoke/console audit verify
+            "$AGENT" --data-dir smoke/agent audit verify
+            echo "::endgroup::"
+          done
+          rm -rf smoke
+
+      - name: Assemble the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXT=""
+          if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
+          NAME="aiit-${VERSION}-${LABEL}"
+          STAGE="stage/$NAME"
+          mkdir -p "$STAGE/onedir" out
+          cp "pyi/onefile/aiit-agent$EXT" "pyi/onefile/aiit-console$EXT" "$STAGE/"
+          cp -R pyi/onedir/aiit-agent pyi/onedir/aiit-console "$STAGE/onedir/"
+          cp LICENSE "$STAGE/LICENSE.txt"
+          cat > "$STAGE/README.txt" <<TXT
+          aiit ${VERSION} for ${LABEL}: standalone builds of aiit-agent and aiit-console.
+          No Python installation is needed. Source and documentation: https://github.com/RockMoon1/AI_IT
+
+          Layout
+            aiit-agent${EXT}, aiit-console${EXT}   single-file builds (carry these on a USB stick)
+            onedir/aiit-agent/, onedir/aiit-console/   one-folder builds (start faster, friendlier to antivirus);
+                                                       run the executable inside, keep the folder together
+
+          These binaries are NOT code-signed or notarised. Windows SmartScreen and macOS Gatekeeper
+          will warn. Verify the download first: the SHA256SUMS file on the release page, and
+            gh attestation verify <archive> --repo RockMoon1/AI_IT
+          macOS: xattr -d com.apple.quarantine <file>   after verifying.   Linux/macOS: chmod +x if needed.
+
+          First steps: aiit-agent enroll <console-enrollment.json>, then aiit-agent collect --issue "..." --out <file>.aiit
+          The frozen console ships the dryrun and ollama providers; the anthropic provider needs the Python wheel.
+          TXT
+          if [ "$ARCHIVE" = "zip" ]; then
+            ( cd stage && python -c "import shutil, sys; shutil.make_archive(sys.argv[1], 'zip', '.', sys.argv[2])" "../out/$NAME" "$NAME" )
+          else
+            tar -C stage -czf "out/$NAME.tar.gz" "$NAME"
+          fi
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.label }}
+          path: out/*
+          if-no-files-found: error
+
+  wheelhouse:
+    name: Offline wheelhouse (${{ matrix.label }})
+    needs: dist
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, label: linux-x86_64 }
+          - { runner: windows-latest, label: windows-x86_64 }
+          - { runner: macos-14, label: macos-arm64 }
+          - { runner: macos-15-intel, label: macos-x86_64 }
+    env:
+      VERSION: ${{ needs.dist.outputs.version }}
+      LABEL: ${{ matrix.label }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Download the dependency closure for CPython 3.10 to 3.14
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          WHEEL="$(ls dist/aiit-*.whl)"
+          NAME="aiit-${VERSION}-wheelhouse-${LABEL}"
+          mkdir -p "$NAME"
+          cp "$WHEEL" "$NAME/"
+          # pydantic-core and cffi ship one wheel per CPython version, so the closure is fetched once per
+          # supported version for this runner's platform. Everything must be a wheel (no sdists to build offline).
+          for py in 3.10 3.11 3.12 3.13 3.14; do
+            python -m pip download --quiet --only-binary=:all: --implementation cp --python-version "$py" --dest "$NAME" "$WHEEL"
+          done
+          cat > "$NAME/INSTALL.txt" <<TXT
+          aiit ${VERSION} offline wheelhouse for ${LABEL} (CPython 3.10 to 3.14).
+          On the offline machine, from the directory that contains this file:
+
+              python -m pip install --no-index --find-links . aiit
+              aiit-agent status
+
+          Verify the download first: SHA256SUMS on the release page, and
+              gh attestation verify <zip> --repo RockMoon1/AI_IT
+          TXT
+          ls -l "$NAME"
+
+      - name: Install from the wheelhouse with no index
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="aiit-${VERSION}-wheelhouse-${LABEL}"
+          python -m venv v
+          if [ "$RUNNER_OS" = "Windows" ]; then VBIN="v/Scripts"; else VBIN="v/bin"; fi
+          "$VBIN/python" -m pip install --quiet --no-index --find-links "$NAME" aiit
+          "$VBIN/aiit-agent" status
+          test "$("$VBIN/aiit-console" --version)" = "aiit-console ${VERSION}"
+
+      - name: Zip it
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="aiit-${VERSION}-wheelhouse-${LABEL}"
+          mkdir -p out
+          python -c "import shutil, sys; shutil.make_archive(sys.argv[1], 'zip', '.', sys.argv[2])" "out/$NAME" "$NAME"
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheelhouse-${{ matrix.label }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    # Only a pushed tag publishes; a workflow_dispatch run (even one started on a tag) is a rehearsal.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [dist, binaries, wheelhouse]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write      # create the release and upload its assets
+      id-token: write      # sign the build-provenance attestation
+      attestations: write  # store it
+    env:
+      VERSION: ${{ needs.dist.outputs.version }}
+      PRERELEASE: ${{ needs.dist.outputs.prerelease }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd assets
+          ls -l
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Build provenance attestation (every asset)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: assets/*
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          set -euo pipefail
+          python packaging/release_notes.py body --tag "$TAG" --assets assets > body.md
+          cat body.md
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          args=(--title "aiit ${VERSION}" --notes-file body.md --verify-tag)
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+          gh release create "$TAG" "${args[@]}" assets/*
+
+  pypi:
+    name: Publish to PyPI
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.dist.outputs.prerelease == 'false'
+    needs: [dist, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/aiit/${{ needs.dist.outputs.version }}/
+    permissions:
+      id-token: write  # trusted publishing (OIDC); no API token is stored anywhere
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          print-hash: true
+
+  testpypi:
+    name: Publish pre-release to TestPyPI
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.dist.outputs.prerelease == 'true'
+    needs: [dist, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/aiit/${{ needs.dist.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist
+          print-hash: true
