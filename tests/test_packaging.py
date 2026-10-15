@@ -85,7 +85,7 @@ class EntryPointTests(unittest.TestCase):
         deps = re.search(r"^dependencies = \[(.*?)\]", _table("project"), re.M | re.S).group(1)
         self.assertEqual(sorted(re.findall(r'"([A-Za-z0-9_-]+)', deps)), ["cryptography", "pydantic"])
         extras = _table("project.optional-dependencies")
-        self.assertRegex(extras, r"^dev = \[")
+        self.assertRegex(extras, r"(?m)^dev = \[")
         release = re.search(r'^release = \[(.*?)\]', extras, re.M).group(1)
         for tool in ("build", "twine", "pyinstaller"):
             self.assertIn(f'"{tool}', release)

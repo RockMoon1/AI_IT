@@ -161,7 +161,7 @@ _SDDL_RIGHTS = {
 # (write/add file, append/add subdirectory, write EA, delete child, write attributes,
 # delete, write DAC, take ownership, generic write, generic all).
 _SDDL_WRITE_MASK = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000 | 0x40000000 | 0x10000000
-_SID_RE = re.compile(r"S-1-\d+(?:-\d+)+")
+_SID_RE = re.compile(r"S-1-\d+(?:-\d+)+", re.IGNORECASE)
 _ACE_RE = re.compile(r"\(([^()]*)\)")
 _DACL_RE = re.compile(r"D:[A-Z]*(?:\([^()]*\))+")
 
@@ -428,7 +428,14 @@ def ensure_private_dir(path: Path, *, owner: str | None = None) -> Path:
             if existed:
                 _check_windows_state_dir(path, owner)
             else:
-                _restrict_windows_state_dir(path, owner)
+                try:
+                    _restrict_windows_state_dir(path, owner)
+                except PermissionError:
+                    # Leave nothing behind: a retry must create (and restrict) the
+                    # directory again instead of finding an unprotected one.
+                    with contextlib.suppress(OSError):
+                        os.rmdir(path)
+                    raise
         return path
     if owner is not None and existed:
         _check_posix_state_dir(path, owner)

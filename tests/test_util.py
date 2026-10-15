@@ -270,6 +270,7 @@ class PrivateDirWindowsPathTests(_PrivateDirBase):
             ensure_private_dir(self.root / "agent", owner="agent")
         self.assertIn("icacls exited 5", str(cm.exception))
         self.assertIn("/inheritance:r", str(cm.exception))
+        self.assertFalse((self.root / "agent").exists())  # nothing unprotected is left behind
         self.allow_loose()
         err = io.StringIO()
         with redirect_stderr(err):
@@ -283,7 +284,8 @@ class PrivateDirWindowsPathTests(_PrivateDirBase):
             with self.assertRaises(PermissionError) as cm:
                 ensure_private_dir(self.root / "agent", owner="agent")
             self.assertIn("elevated", str(cm.exception))
-            self.assertFalse((self.root / "agent").exists() and fake.grants)
+            self.assertFalse((self.root / "agent").exists())  # nothing unprotected is left behind
+            self.assertEqual(fake.grants, [])
             self.allow_loose()
             err = io.StringIO()
             with redirect_stderr(err):
